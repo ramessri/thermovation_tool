@@ -1,0 +1,116 @@
+# Production stack — all services run in Docker.
+#
+# Setup:
+#   cp .env.example .env      # fill in SECRET_KEY, GEMINI_API_KEY, CORS_ORIGINS
+#   docker compose -f docker-compose.prod.yml up -d
+#
+# Migrations run automatically on API startup.
+# GPU worker image must be built locally (CUDA arch targeting).
+
+services:
+
+  # ── PostgreSQL ──────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER:     photogram
+      POSTGRES_PASSWORD: photogram
+      POSTGRES_DB:       photogram
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    # Not exposed to host in prod — API connects via internal network
+
+  # ── Redis ───────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    # Not exposed to host in prod
+
+  # ── FastAPI ─────────────────────────────────────────────────────────────────
+  api:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.api
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://photogram:photogram@postgres:5432/photogram
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/1
+      APP_ENV: production
+      STORAGE_BACKEND: local
+      LOCAL_STORAGE_ROOT: /app/storage
+    volumes:
+      - ./storage:/app/storage
+      - ./models:/app/models
+    # Migrate then start — idempotent, safe on restarts
+    command: >
+      sh -c "alembic upgrade head &&
+             uvicorn backend.main:app --host 0.0.0.0 --port 8000 --workers 2"
+    ports:
+      - "8000:8000"
+    depends_on:
+      - postgres
+      - redis
+
+  # ── Celery GPU Worker ──────────────────────────────────────────────────────
+  worker-gpu:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.worker-gpu
+    restart: unless-stopped
+    # Required for CUDA CDI on hosts using the CDI device reference
+    privileged: true
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://photogram:photogram@postgres:5432/photogram
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/1
+      STORAGE_BACKEND: local
+      LOCAL_STORAGE_ROOT: /app/storage
+      HF_HOME: /app/models/huggingface
+      PYTHONPATH: /app
+      DEPTH_FUSION_ENABLED: "false"
+    volumes:
+      - ./storage:/app/storage
+      - ./models:/app/models
+    depends_on:
+      - redis
+      - postgres
+    devices:
+      - nvidia.com/gpu=all
+    command: >
+      celery -A backend.workers.tasks.celery_app worker
+      --loglevel=info
+      --queues=gpu,celery
+      --concurrency=1
+
+  # ── Next.js Frontend ────────────────────────────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: ../docker/Dockerfile.frontend
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    depends_on:
+      - api
+
+  # ── Flower (optional — Celery task monitor) ─────────────────────────────────
+  # Enable with:  docker compose -f docker-compose.prod.yml --profile tools up -d
+  flower:
+    image: mher/flower:2.0
+    restart: unless-stopped
+    profiles: ["tools"]
+    environment:
+      CELERY_BROKER_URL: redis://redis:6379/0
+    ports:
+      - "5555:5555"
+    depends_on:
+      - redis
+
+volumes:
+  postgres_data:

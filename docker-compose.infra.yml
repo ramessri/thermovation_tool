@@ -1,0 +1,61 @@
+# Minimal Docker services for native dev.
+# Starts only postgres, redis, and the GPU worker.
+# Run the API and frontend natively (see Makefile dev-* targets).
+#
+# Usage:  docker compose -f docker-compose.infra.yml up -d
+
+services:
+
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER:     photogram
+      POSTGRES_PASSWORD: photogram
+      POSTGRES_DB:       photogram
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5433:5432"   # exposed on host so native API can connect
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+
+  worker-gpu:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.worker-gpu
+    restart: unless-stopped
+    env_file: .env.dev
+    privileged: true
+    environment:
+      DATABASE_URL: postgresql+asyncpg://photogram:photogram@postgres:5432/photogram
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/1
+      STORAGE_BACKEND: local
+      LOCAL_STORAGE_ROOT: /app/storage
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./storage:/app/storage
+      - ./models:/app/models
+      - ./backend:/app/backend
+      - ./ml:/app/ml
+      - ./tests:/app/tests
+    depends_on:
+      - postgres
+      - redis
+    devices:
+      - nvidia.com/gpu=all
+    command: >
+      celery -A backend.workers.tasks.celery_app worker
+      --loglevel=info
+      --queues=gpu,celery
+      --concurrency=1
+
+volumes:
+  postgres_data:

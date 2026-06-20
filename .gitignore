@@ -1,0 +1,71 @@
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Storage & models (large binary data)
+storage/
+models/
+/tmp/photogram/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+.mypy_cache/
+.ruff_cache/
+
+# Node
+node_modules/
+.next/
+out/
+.turbo/
+
+# Docker
+docker/volumes/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Claude Code workspace
+.claude/
+
+# Sample inputs (large binary) and per-stage manifests
+samples/*.mp4
+samples/*.mov
+samples/*.jpg
+samples/*.jpeg
+samples/*.png
+samples/*.pdf
+samples/manifests/
+
+# Docs: keep walkthrough.mp4 (used in README), ignore source WebM
+docs/images/*.webm
+backend/third_party/
+
+# TypeScript build cache
+frontend/tsconfig.tsbuildinfo
+frontend/.next/
+
+# Local dev env (machine-specific DB/redis URLs)
+.env.dev
+
+# Sample media in subdirectories
+samples/**/*.mp4
+samples/**/*.mov
+samples/**/*.jpg
+samples/**/*.jpeg
+samples/**/*.png
+samples/**/*.heic

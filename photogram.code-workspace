@@ -1,0 +1,484 @@
+{
+  "folders": [
+    { "path": ".", "name": "photogram" },
+    { "path": "frontend", "name": "frontend" }
+  ],
+  "settings": {
+    "python.defaultInterpreterPath": "/usr/bin/python3",
+    "editor.formatOnSave": true,
+    "files.exclude": {
+      "**/node_modules": true,
+      "**/__pycache__": true,
+      "**/.next": true,
+      "storage/**": true,
+      "models/**": true
+    },
+    "search.exclude": {
+      "**/node_modules": true,
+      "**/__pycache__": true,
+      "storage/**": true,
+      "models/**": true,
+      "samples/manifests/**": true
+    }
+  },
+
+  "tasks": {
+    "version": "2.0.0",
+    "tasks": [
+
+      // ── Compose: lifecycle ──────────────────────────────────────────────────
+
+      {
+        "label": "compose: up (detached)",
+        "type": "shell",
+        "command": "docker compose up --build -d",
+        "group": "build",
+        "presentation": { "panel": "shared", "reveal": "always" },
+        "problemMatcher": []
+      },
+      {
+        "label": "compose: up (foreground)",
+        "type": "shell",
+        "command": "docker compose up --build",
+        "group": "build",
+        "presentation": { "panel": "dedicated", "reveal": "always" },
+        "problemMatcher": []
+      },
+      {
+        "label": "compose: down",
+        "type": "shell",
+        "command": "docker compose down",
+        "presentation": { "panel": "shared", "reveal": "always" },
+        "problemMatcher": []
+      },
+      {
+        "label": "compose: restart gpu worker (pick up code changes)",
+        "type": "shell",
+        "command": "docker compose restart worker-gpu",
+        "presentation": { "panel": "shared", "reveal": "always" },
+        "problemMatcher": []
+      },
+      {
+        "label": "compose: restart api",
+        "type": "shell",
+        "command": "docker compose restart api",
+        "presentation": { "panel": "shared", "reveal": "always" },
+        "problemMatcher": []
+      },
+
+      // ── Compose: logs ───────────────────────────────────────────────────────
+
+      {
+        "label": "logs: all services",
+        "type": "shell",
+        "command": "docker compose logs -f",
+        "presentation": { "panel": "dedicated", "reveal": "always" },
+        "problemMatcher": []
+      },
+      {
+        "label": "logs: gpu worker",
+        "type": "shell",
+        "command": "docker compose logs -f worker-gpu",
+        "presentation": { "panel": "dedicated", "reveal": "always" },
+        "problemMatcher": []
+      },
+      {
+        "label": "logs: api",
+        "type": "shell",
+        "command": "docker compose logs -f api",
+        "presentation": { "panel": "dedicated", "reveal": "always" },
+        "problemMatcher": []
+      },
+      {
+        "label": "logs: frontend",
+        "type": "shell",
+        "command": "docker compose logs -f frontend",
+        "presentation": { "panel": "dedicated", "reveal": "always" },
+        "problemMatcher": []
+      },
+
+      // ── Compose: shells ─────────────────────────────────────────────────────
+
+      {
+        "label": "shell: gpu worker",
+        "type": "shell",
+        "command": "docker compose exec worker-gpu bash",
+        "presentation": { "panel": "dedicated", "reveal": "always" },
+        "problemMatcher": []
+      },
+      {
+        "label": "shell: api",
+        "type": "shell",
+        "command": "docker compose exec api bash",
+        "presentation": { "panel": "dedicated", "reveal": "always" },
+        "problemMatcher": []
+      },
+      {
+        "label": "shell: postgres",
+        "type": "shell",
+        "command": "docker compose exec postgres psql -U photogram -d photogram",
+        "presentation": { "panel": "dedicated", "reveal": "always" },
+        "problemMatcher": []
+      },
+      {
+        "label": "shell: redis cli (result backend)",
+        "type": "shell",
+        "command": "docker compose exec redis redis-cli -n 1",
+        "presentation": { "panel": "dedicated", "reveal": "always" },
+        "problemMatcher": []
+      },
+
+      // ── Database ────────────────────────────────────────────────────────────
+
+      {
+        "label": "db: migrate (alembic upgrade head)",
+        "type": "shell",
+        "command": "docker compose exec api alembic upgrade head",
+        "presentation": { "panel": "shared", "reveal": "always" },
+        "problemMatcher": []
+      },
+      {
+        "label": "db: show current revision",
+        "type": "shell",
+        "command": "docker compose exec api alembic current",
+        "presentation": { "panel": "shared", "reveal": "always" },
+        "problemMatcher": []
+      },
+      {
+        "label": "db: show migration history",
+        "type": "shell",
+        "command": "docker compose exec api alembic history --verbose",
+        "presentation": { "panel": "shared", "reveal": "always" },
+        "problemMatcher": []
+      },
+      {
+        "label": "db: stamp head (skip to latest without running)",
+        "type": "shell",
+        "command": "docker compose exec api alembic stamp head",
+        "presentation": { "panel": "shared", "reveal": "always" },
+        "problemMatcher": []
+      },
+      {
+        "label": "db: show recent jobs",
+        "type": "shell",
+        "command": "docker compose exec postgres psql -U photogram -d photogram -c \"SELECT j.stage, j.status, j.progress, left(j.error,80) AS error, j.created_at FROM jobs j ORDER BY j.created_at DESC LIMIT 20;\"",
+        "presentation": { "panel": "shared", "reveal": "always" },
+        "problemMatcher": []
+      },
+      {
+        "label": "db: show projects",
+        "type": "shell",
+        "command": "docker compose exec postgres psql -U photogram -d photogram -c \"SELECT id, name, status, coverage_score, confirmed_scale_factor FROM projects ORDER BY created_at DESC LIMIT 10;\"",
+        "presentation": { "panel": "shared", "reveal": "always" },
+        "problemMatcher": []
+      },
+
+      // ── Build ────────────────────────────────────────────────────────────────
+
+      {
+        "label": "build: gpu worker image",
+        "type": "shell",
+        "command": "docker compose build worker-gpu",
+        "group": "build",
+        "presentation": { "panel": "dedicated", "reveal": "always" },
+        "problemMatcher": []
+      },
+      {
+        "label": "build: api image",
+        "type": "shell",
+        "command": "docker compose build api",
+        "group": "build",
+        "presentation": { "panel": "dedicated", "reveal": "always" },
+        "problemMatcher": []
+      },
+      {
+        "label": "build: all images",
+        "type": "shell",
+        "command": "docker compose build",
+        "group": "build",
+        "presentation": { "panel": "dedicated", "reveal": "always" },
+        "problemMatcher": []
+      },
+
+      // ── End-to-end test ─────────────────────────────────────────────────────
+
+      {
+        "label": "test: full end-to-end pipeline",
+        "type": "shell",
+        "command": "python scripts/e2e_test.py",
+        "group": { "kind": "test", "isDefault": true },
+        "presentation": { "panel": "dedicated", "reveal": "always", "clear": true },
+        "problemMatcher": []
+      },
+      {
+        "label": "test: e2e with manual scale (1 m)",
+        "type": "shell",
+        "command": "python scripts/e2e_test.py --manual-scale-mm 1000",
+        "group": "test",
+        "presentation": { "panel": "dedicated", "reveal": "always", "clear": true },
+        "problemMatcher": []
+      },
+
+      // ── Smoke tests ─────────────────────────────────────────────────────────
+
+      {
+        "label": "smoke: full pipeline",
+        "type": "shell",
+        "command": "docker compose exec worker-gpu python /app/scripts/smoke.py --stage all",
+        "group": "test",
+        "presentation": { "panel": "dedicated", "reveal": "always" },
+        "problemMatcher": []
+      },
+      {
+        "label": "smoke: extract_frames",
+        "type": "shell",
+        "command": "docker compose exec worker-gpu python /app/scripts/smoke.py --stage extract_frames",
+        "group": "test",
+        "presentation": { "panel": "shared", "reveal": "always" },
+        "problemMatcher": []
+      },
+      {
+        "label": "smoke: feature_matching",
+        "type": "shell",
+        "command": "docker compose exec worker-gpu python /app/scripts/smoke.py --stage feature_matching",
+        "group": "test",
+        "presentation": { "panel": "shared", "reveal": "always" },
+        "problemMatcher": []
+      },
+      {
+        "label": "smoke: sfm",
+        "type": "shell",
+        "command": "docker compose exec worker-gpu python /app/scripts/smoke.py --stage sfm",
+        "group": "test",
+        "presentation": { "panel": "shared", "reveal": "always" },
+        "problemMatcher": []
+      },
+      {
+        "label": "smoke: scene_understanding",
+        "type": "shell",
+        "command": "docker compose exec worker-gpu python /app/scripts/smoke.py --stage scene_understanding",
+        "group": "test",
+        "presentation": { "panel": "shared", "reveal": "always" },
+        "problemMatcher": []
+      },
+      {
+        "label": "smoke: mvs",
+        "type": "shell",
+        "command": "docker compose exec worker-gpu python /app/scripts/smoke.py --stage mvs",
+        "group": "test",
+        "presentation": { "panel": "shared", "reveal": "always" },
+        "problemMatcher": []
+      },
+      {
+        "label": "smoke: depth_fusion",
+        "type": "shell",
+        "command": "docker compose exec worker-gpu python /app/scripts/smoke.py --stage depth_fusion",
+        "group": "test",
+        "presentation": { "panel": "shared", "reveal": "always" },
+        "problemMatcher": []
+      },
+      {
+        "label": "smoke: coverage",
+        "type": "shell",
+        "command": "docker compose exec worker-gpu python /app/scripts/smoke.py --stage coverage",
+        "group": "test",
+        "presentation": { "panel": "shared", "reveal": "always" },
+        "problemMatcher": []
+      },
+      {
+        "label": "smoke: export",
+        "type": "shell",
+        "command": "docker compose exec worker-gpu python /app/scripts/smoke.py --stage export",
+        "group": "test",
+        "presentation": { "panel": "shared", "reveal": "always" },
+        "problemMatcher": []
+      },
+
+      // ── CUDA / GPU diagnostics ───────────────────────────────────────────────
+
+      {
+        "label": "gpu: verify CUDA in worker",
+        "type": "shell",
+        "command": "docker compose exec worker-gpu python -c \"import torch; print('CUDA:', torch.cuda.is_available()); print('Device:', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'N/A')\"",
+        "presentation": { "panel": "shared", "reveal": "always" },
+        "problemMatcher": []
+      },
+      {
+        "label": "gpu: nvidia-smi",
+        "type": "shell",
+        "command": "docker compose exec worker-gpu nvidia-smi",
+        "presentation": { "panel": "shared", "reveal": "always" },
+        "problemMatcher": []
+      },
+      {
+        "label": "gpu: watch nvidia-smi (1s refresh)",
+        "type": "shell",
+        "command": "docker compose exec worker-gpu watch -n1 nvidia-smi",
+        "presentation": { "panel": "dedicated", "reveal": "always" },
+        "problemMatcher": []
+      },
+
+      // ── Celery / queue ───────────────────────────────────────────────────────
+
+      {
+        "label": "celery: inspect active tasks",
+        "type": "shell",
+        "command": "docker compose exec worker-gpu celery -A backend.workers.tasks.celery_app inspect active",
+        "presentation": { "panel": "shared", "reveal": "always" },
+        "problemMatcher": []
+      },
+      {
+        "label": "celery: inspect registered tasks",
+        "type": "shell",
+        "command": "docker compose exec worker-gpu celery -A backend.workers.tasks.celery_app inspect registered",
+        "presentation": { "panel": "shared", "reveal": "always" },
+        "problemMatcher": []
+      },
+      {
+        "label": "celery: purge all queues",
+        "type": "shell",
+        "command": "docker compose exec worker-gpu celery -A backend.workers.tasks.celery_app purge -f",
+        "presentation": { "panel": "shared", "reveal": "always" },
+        "problemMatcher": []
+      },
+
+      // ── Frontend ─────────────────────────────────────────────────────────────
+
+      {
+        "label": "frontend: dev server (local, outside Docker)",
+        "type": "shell",
+        "command": "npm run dev",
+        "options": { "cwd": "${workspaceFolder:frontend}" },
+        "group": "build",
+        "presentation": { "panel": "dedicated", "reveal": "always" },
+        "problemMatcher": []
+      },
+      {
+        "label": "frontend: type-check",
+        "type": "shell",
+        "command": "npm run build -- --no-emit 2>&1 || npx tsc --noEmit",
+        "options": { "cwd": "${workspaceFolder:frontend}" },
+        "group": "test",
+        "presentation": { "panel": "shared", "reveal": "always" },
+        "problemMatcher": ["$tsc"]
+      },
+      {
+        "label": "frontend: install deps",
+        "type": "shell",
+        "command": "npm install",
+        "options": { "cwd": "${workspaceFolder:frontend}" },
+        "presentation": { "panel": "shared", "reveal": "always" },
+        "problemMatcher": []
+      },
+
+      // ── Storage ──────────────────────────────────────────────────────────────
+
+      {
+        "label": "storage: list project files",
+        "type": "shell",
+        "command": "find storage/ -type f | sort | head -60",
+        "presentation": { "panel": "shared", "reveal": "always" },
+        "problemMatcher": []
+      },
+      {
+        "label": "storage: clear all (smoke + test projects)",
+        "type": "shell",
+        "command": "rm -rf storage/smoke storage/test* && echo 'Cleared smoke/test storage'",
+        "presentation": { "panel": "shared", "reveal": "always" },
+        "problemMatcher": []
+      },
+      {
+        "label": "storage: clear smoke manifests",
+        "type": "shell",
+        "command": "rm -f samples/manifests/*.json && echo 'Manifests cleared'",
+        "presentation": { "panel": "shared", "reveal": "always" },
+        "problemMatcher": []
+      },
+
+      // ── ML model management ──────────────────────────────────────────────────
+
+      {
+        "label": "models: list cached model dirs",
+        "type": "shell",
+        "command": "du -sh models/*/  2>/dev/null || echo 'No models cached yet'",
+        "presentation": { "panel": "shared", "reveal": "always" },
+        "problemMatcher": []
+      },
+      {
+        "label": "models: verify LLaVA cached",
+        "type": "shell",
+        "command": "docker compose exec worker-gpu python -c \"from transformers import LlavaNextProcessor; LlavaNextProcessor.from_pretrained('llava-hf/llava-1.5-7b-hf', cache_dir='/app/models/llava'); print('LLaVA OK')\"",
+        "presentation": { "panel": "shared", "reveal": "always" },
+        "problemMatcher": []
+      },
+      {
+        "label": "models: verify Depth Anything v2 cached",
+        "type": "shell",
+        "command": "docker compose exec worker-gpu python -c \"from transformers import AutoImageProcessor; AutoImageProcessor.from_pretrained('depth-anything/Depth-Anything-V2-Large-hf', cache_dir='/app/models/depth_anything'); print('DA2 OK')\"",
+        "presentation": { "panel": "shared", "reveal": "always" },
+        "problemMatcher": []
+      },
+      {
+        "label": "models: verify Grounding DINO cached",
+        "type": "shell",
+        "command": "docker compose exec worker-gpu python -c \"from transformers import AutoProcessor; AutoProcessor.from_pretrained('IDEA-Research/grounding-dino-base', cache_dir='/app/models/gdino'); print('GDINO OK')\"",
+        "presentation": { "panel": "shared", "reveal": "always" },
+        "problemMatcher": []
+      },
+
+      // ── Git ──────────────────────────────────────────────────────────────────
+
+      {
+        "label": "git: log (last 10)",
+        "type": "shell",
+        "command": "git log --oneline -10",
+        "presentation": { "panel": "shared", "reveal": "always" },
+        "problemMatcher": []
+      },
+      {
+        "label": "git: status",
+        "type": "shell",
+        "command": "git status",
+        "presentation": { "panel": "shared", "reveal": "always" },
+        "problemMatcher": []
+      }
+
+    ]
+  },
+
+  "launch": {
+    "version": "0.2.0",
+    "configurations": [
+      {
+        "name": "FastAPI (local, no Docker)",
+        "type": "python",
+        "request": "launch",
+        "module": "uvicorn",
+        "args": ["backend.main:app", "--reload", "--port", "8000"],
+        "cwd": "${workspaceFolder:photogram}",
+        "env": {
+          "DATABASE_URL": "postgresql+asyncpg://photogram:photogram@localhost:5433/photogram",
+          "REDIS_URL": "redis://localhost:6379/0",
+          "CELERY_BROKER_URL": "redis://localhost:6379/0",
+          "CELERY_RESULT_BACKEND": "redis://localhost:6379/1",
+          "STORAGE_BACKEND": "local",
+          "LOCAL_STORAGE_ROOT": "${workspaceFolder:photogram}/storage"
+        },
+        "justMyCode": false
+      }
+    ]
+  },
+
+  "extensions": {
+    "recommendations": [
+      "ms-python.python",
+      "ms-python.pylance",
+      "ms-azuretools.vscode-docker",
+      "bradlc.vscode-tailwindcss",
+      "dbaeumer.vscode-eslint",
+      "esbenp.prettier-vscode",
+      "ms-vscode.makefile-tools",
+      "tamasfe.even-better-toml"
+    ]
+  }
+}

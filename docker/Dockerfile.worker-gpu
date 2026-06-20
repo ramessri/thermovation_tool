@@ -1,0 +1,111 @@
+# GPU worker — requires nvidia-container-toolkit on host
+# Uncomment worker-gpu service in docker-compose.yml to enable
+FROM nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTHONUNBUFFERED=1
+ENV PIP_NO_CACHE_DIR=1
+
+WORKDIR /app
+
+# System deps:
+# - python3.10 (default for ubuntu 22.04 and well-supported by pycolmap wheels)
+# - libgl1, libglib2.0-0: OpenCV runtime
+# - ceres-solver / eigen / flann / metis / freeimage: COLMAP runtime libs
+# - cuda-nvcc + dev libs: needed to build COLMAP with CUDA (dense stereo).
+#   The PyPI pycolmap wheels are CPU-only, so we build a CUDA-enabled
+#   `colmap` CLI from source and invoke it via subprocess in mvs.py.
+# - git, cmake, ninja: COLMAP build toolchain
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        python3 python3-pip python3-dev \
+        libgl1 libglib2.0-0 libsm6 libxext6 libxrender1 \
+        libceres2 libceres-dev libeigen3-dev libflann1.9 libflann-dev \
+        libfreeimage3 libfreeimage-dev \
+        libmetis5 libmetis-dev libgoogle-glog0v5 libgflags2.2 \
+        libsuitesparse-dev libboost-program-options1.74.0 libboost-all-dev \
+        libsqlite3-dev libglew-dev libcgal-dev \
+        cmake ninja-build build-essential \
+        cuda-nvcc-12-4 cuda-cudart-dev-12-4 cuda-libraries-dev-12-4 \
+        libcublas-dev-12-4 libcusolver-dev-12-4 libcurand-dev-12-4 \
+        git ca-certificates curl \
+        ffmpeg libimage-exiftool-perl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Build CUDA-enabled COLMAP for dense stereo reconstruction.
+# RTX 4070 Ti is sm_89 (Ada Lovelace); add archs as needed (75=Turing, 86=Ampere).
+ENV CUDA_HOME=/usr/local/cuda-12.4
+ENV PATH=${CUDA_HOME}/bin:${PATH}
+RUN cd /tmp && \
+    git clone --depth 1 --branch 3.9.1 https://github.com/colmap/colmap.git colmap-src && \
+    cmake -S colmap-src -B colmap-src/build -GNinja \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCUDA_ENABLED=ON \
+        -DCMAKE_CUDA_ARCHITECTURES="75;86;89" \
+        -DCMAKE_CUDA_COMPILER=${CUDA_HOME}/bin/nvcc \
+        -DGUI_ENABLED=OFF \
+        -DTESTS_ENABLED=OFF && \
+    ninja -C colmap-src/build && \
+    ninja -C colmap-src/build install && \
+    rm -rf /tmp/colmap-src && \
+    colmap -h 2>&1 | head -3
+
+RUN ln -sf /usr/bin/python3 /usr/bin/python && \
+    python -m pip install --upgrade pip setuptools wheel
+
+COPY backend/requirements.txt .
+
+# Install torch with CUDA support first (so the lightglue install picks it up)
+RUN pip install torch==2.4.1 torchvision==0.19.1 --index-url https://download.pytorch.org/whl/cu124
+
+RUN pip install -r requirements.txt && pip install pytest
+
+# MASt3R (NAVER) — dense metric reconstruction from image pairs.
+# No setup.py; installed via sys.path at runtime from /opt/mast3r.
+RUN cd /opt && \
+    git clone --depth 1 https://github.com/naver/mast3r.git && \
+    cd mast3r && git submodule update --init --recursive --depth 1 && \
+    pip install --quiet -r /opt/mast3r/requirements.txt && \
+    pip install --quiet -r /opt/mast3r/dust3r/requirements.txt && \
+    python -c "import sys; sys.path.insert(0,'/opt/mast3r'); sys.path.insert(0,'/opt/mast3r/dust3r'); from mast3r.model import AsymmetricMASt3R; print('MASt3R OK')"
+
+# Weights are downloaded on first use to HF_HOME=/app/models/huggingface (persistent volume).
+
+# Original gaussian-splatting (graphdeco-inria) + its CUDA extensions.
+# Uses diff-gaussian-rasterization + simple-knn instead of gsplat/nerfstudio
+# — simpler CUDA kernels, more stable on NVIDIA 595.x drivers.
+RUN cd /opt && \
+    git clone --depth 1 --recursive https://github.com/graphdeco-inria/gaussian-splatting.git && \
+    TORCH_CUDA_ARCH_LIST="7.5;8.6;8.9" \
+    pip install --no-build-isolation /opt/gaussian-splatting/submodules/diff-gaussian-rasterization && \
+    TORCH_CUDA_ARCH_LIST="7.5;8.6;8.9" \
+    pip install --no-build-isolation /opt/gaussian-splatting/submodules/simple-knn && \
+    pip install plyfile
+
+# Pre-download LightGlue + DISK weights to /app/models so the worker doesn't
+# fetch them on first run.
+ENV TORCH_HOME=/app/models/torch
+RUN mkdir -p /app/models/torch && \
+    python -c "from lightglue import LightGlue, DISK; \
+import torch; \
+DISK(max_num_keypoints=2048); \
+LightGlue(features='disk')" || \
+    echo "[warn] LightGlue weight prefetch failed — will lazy-load at runtime"
+
+# Pre-download Grounding DINO weights so the worker doesn't fetch them at runtime.
+RUN python -c "from transformers import AutoProcessor, AutoModelForZeroShotObjectDetection; AutoProcessor.from_pretrained('IDEA-Research/grounding-dino-base', cache_dir='/app/models/gdino'); AutoModelForZeroShotObjectDetection.from_pretrained('IDEA-Research/grounding-dino-base', cache_dir='/app/models/gdino'); print('Grounding DINO weights cached.')" \
+    || echo "[warn] Grounding DINO prefetch failed — will lazy-load at runtime"
+
+# Pre-download LLaVA 1.5 7B (4-bit) weights for scene understanding.
+# Single-line: Docker parser misinterprets 'from X import Y' at line-start as FROM instruction.
+RUN python -c "import torch; from transformers import LlavaNextProcessor, LlavaNextForConditionalGeneration, BitsAndBytesConfig; bnb = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_compute_dtype=torch.bfloat16); LlavaNextProcessor.from_pretrained('llava-hf/llava-1.5-7b-hf', cache_dir='/app/models/llava'); LlavaNextForConditionalGeneration.from_pretrained('llava-hf/llava-1.5-7b-hf', quantization_config=bnb, cache_dir='/app/models/llava', device_map='cpu'); print('LLaVA 1.5 7B weights cached.')" \
+    || echo "[warn] LLaVA prefetch failed — will lazy-load at runtime"
+
+# Pre-download Depth Anything v2 Large weights for monocular depth fusion.
+RUN python -c "from transformers import AutoImageProcessor, AutoModelForDepthEstimation; AutoImageProcessor.from_pretrained('depth-anything/Depth-Anything-V2-Large-hf', cache_dir='/app/models/depth_anything'); AutoModelForDepthEstimation.from_pretrained('depth-anything/Depth-Anything-V2-Large-hf', cache_dir='/app/models/depth_anything'); print('Depth Anything v2 Large weights cached.')" \
+    || echo "[warn] Depth Anything prefetch failed — will lazy-load at runtime"
+
+COPY backend/ ./backend/
+COPY ml/ ./ml/
+
+CMD ["celery", "-A", "backend.workers.tasks.celery_app", "worker", \
+     "--loglevel=info", "--queues=gpu,celery", "--concurrency=1"]

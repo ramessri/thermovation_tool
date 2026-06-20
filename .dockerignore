@@ -1,0 +1,8 @@
+storage/
+models/
+samples/manifests/
+**/__pycache__/
+**/*.pyc
+**/.next/
+**/node_modules/
+.git/

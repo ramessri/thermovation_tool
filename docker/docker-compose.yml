@@ -1,0 +1,106 @@
+services:
+
+  # ── PostgreSQL ──────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER:     photogram
+      POSTGRES_PASSWORD: photogram
+      POSTGRES_DB:       photogram
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+
+  # ── Redis ───────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+
+  # ── FastAPI ─────────────────────────────────────────────────────────────────
+  api:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.api
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./storage:/app/storage        # local storage mount
+      - ./models:/app/models          # ML model cache
+    ports:
+      - "8000:8000"
+    depends_on:
+      - postgres
+      - redis
+
+  # ── Celery CPU Worker ───────────────────────────────────────────────────────
+  worker-cpu:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.worker-cpu
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./storage:/app/storage
+      - ./models:/app/models
+    depends_on:
+      - redis
+      - postgres
+    command: >
+      celery -A backend.workers.tasks.celery_app worker
+      --loglevel=info
+      --queues=default
+      --concurrency=2
+
+  # ── Celery GPU Worker (comment out if no GPU available) ─────────────────────
+  # worker-gpu:
+  #   build:
+  #     context: .
+  #     dockerfile: docker/Dockerfile.worker-gpu
+  #   restart: unless-stopped
+  #   env_file: .env
+  #   runtime: nvidia
+  #   environment:
+  #     NVIDIA_VISIBLE_DEVICES: all
+  #   volumes:
+  #     - ./storage:/app/storage
+  #     - ./models:/app/models
+  #   depends_on:
+  #     - redis
+  #   command: >
+  #     celery -A backend.workers.tasks.celery_app worker
+  #     --loglevel=info
+  #     --queues=gpu
+  #     --concurrency=1
+
+  # ── Flower (Celery monitor) ─────────────────────────────────────────────────
+  flower:
+    image: mher/flower:2.0
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "5555:5555"
+    environment:
+      CELERY_BROKER_URL: redis://redis:6379/0
+    depends_on:
+      - redis
+
+  # ── Next.js Frontend ────────────────────────────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: ../docker/Dockerfile.frontend
+    restart: unless-stopped
+    environment:
+      NEXT_PUBLIC_API_URL: http://localhost:8000
+      NEXT_PUBLIC_WS_URL:  ws://localhost:8000
+    ports:
+      - "3000:3000"
+    depends_on:
+      - api
+
+volumes:
+  postgres_data:

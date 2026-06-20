@@ -1,0 +1,39 @@
+# API-only dependencies — no GPU/ML/scipy/open3d packages.
+# Install in local venv for native dev; use requirements.txt in Docker worker only.
+
+# Core
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+pydantic==2.5.0
+pydantic-settings==2.1.0
+python-multipart==0.0.6
+
+# Database
+sqlalchemy==2.0.23
+alembic==1.12.1
+asyncpg==0.29.0
+psycopg2-binary==2.9.9
+
+# Celery + Redis (submit tasks; does not run them)
+celery==5.3.4
+redis==5.0.0
+
+# Async / HTTP
+httpx==0.25.2
+aiofiles==23.2.1
+aiohttp==3.9.1
+nest-asyncio==1.5.8
+
+# Storage backends
+boto3==1.28.85
+requests==2.31.0
+
+# Image handling (calibration endpoint + ArUco sheet generation)
+Pillow==10.4.0
+numpy==1.26.4
+
+# Utils
+python-dotenv==1.0.0
+tqdm==4.66.5
+reportlab
+opencv-python-headless==4.8.1.78

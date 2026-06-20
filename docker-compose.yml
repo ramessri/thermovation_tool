@@ -1,0 +1,170 @@
+services:
+
+  # ── PostgreSQL ──────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER:     photogram
+      POSTGRES_PASSWORD: photogram
+      POSTGRES_DB:       photogram
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5433:5432"
+
+  # ── Redis ───────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+
+  # ── FastAPI ─────────────────────────────────────────────────────────────────
+  api:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.api
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://photogram:photogram@postgres:5432/photogram
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/1
+      APP_ENV: development
+      SECRET_KEY: "${SECRET_KEY:-change_me_in_production}"
+      STORAGE_BACKEND: local
+      CORS_ORIGINS: "${CORS_ORIGINS:-http://localhost:3000}"
+      LOCAL_STORAGE_ROOT: /app/storage
+      OLLAMA_URL: http://host.docker.internal:11434
+      OLLAMA_DIMENSION_MODEL: qwen2.5:7b
+      OLLAMA_GENERAL_MODEL: llama3.1:8b
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./storage:/app/storage        # local storage mount
+      - ./models:/app/models          # ML model cache
+      - ./backend:/app/backend        # hot-reload for API + task chain changes
+      - ./ml:/app/ml
+      - ./alembic:/app/alembic        # migrations visible without image rebuild
+    command: >
+      uvicorn backend.main:app --host 0.0.0.0 --port 8000 --reload
+      --reload-exclude "*/pipeline/*"
+      --reload-exclude "*/workers/pipeline/*"
+      --reload-exclude "*/storage/*"
+      --reload-exclude "*/models/*"
+    ports:
+      - "8000:8000"
+    depends_on:
+      - postgres
+      - redis
+
+  # ── Celery CPU Worker ───────────────────────────────────────────────────────
+  # Handles CPU-queue tasks (extract_metadata, extract_frames, detect_aruco,
+  # and all post-MVS stages). Disabled by default — start manually when running
+  # concurrent pipelines to prevent CPU-queue starvation behind GPU stages:
+  #   docker compose --profile cpu-worker up -d worker-cpu
+  worker-cpu:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.worker-cpu
+    restart: "no"
+    profiles: ["cpu-worker"]
+    env_file: .env
+    environment:
+      PYTHONPATH: /app
+    volumes:
+      - ./storage:/app/storage
+      - ./models:/app/models
+      - ./backend:/app/backend
+      - ./ml:/app/ml
+    depends_on:
+      - redis
+      - postgres
+    command: >
+      celery -A backend.workers.tasks.celery_app worker
+      --loglevel=info
+      --queues=celery
+      --concurrency=2
+      -E
+
+  # ── Celery GPU Worker ──────────────────────────────────────────────────────
+  worker-gpu:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.worker-gpu
+    restart: unless-stopped
+    env_file: .env
+    privileged: true
+    environment:
+      DATABASE_URL: postgresql+asyncpg://photogram:photogram@postgres:5432/photogram
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/1
+      STORAGE_BACKEND: local
+      LOCAL_STORAGE_ROOT: /app/storage
+      NVIDIA_VISIBLE_DEVICES: "0"
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      PYTHONPATH: /app
+      HF_HOME: /app/models/huggingface
+      OLLAMA_URL: http://host.docker.internal:11434
+      OLLAMA_VISION_MODEL: qwen2.5vl:7b
+      VLM_TIMEOUT: "120"
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      # DA-V2 depth fusion disabled: produces phantom camera-frustum geometry.
+      # Re-enable once per-pixel confidence filtering is implemented.
+      DEPTH_FUSION_ENABLED: "false"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./storage:/app/storage
+      - ./models:/app/models
+      - ./scripts:/app/scripts
+      - ./samples:/app/samples
+      - ./tests:/app/tests
+      # Mount backend & ml in for hot-reload during pipeline development.
+      - ./backend:/app/backend
+      - ./ml:/app/ml
+    depends_on:
+      - redis
+      - postgres
+    # Host has NVIDIA CDI registered (see `docker info` -> CDI). Use the
+    # CDI device reference rather than the legacy "nvidia" runtime driver.
+    devices:
+      - nvidia.com/gpu=all
+    command: >
+      celery -A backend.workers.tasks.celery_app worker
+      --loglevel=info
+      --queues=gpu,celery
+      --concurrency=1
+
+  # ── Flower (Celery monitor) ─────────────────────────────────────────────────
+  flower:
+    image: mher/flower:2.0
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "5555:5555"
+    environment:
+      CELERY_BROKER_URL: redis://redis:6379/0
+    depends_on:
+      - redis
+
+  # ── Next.js Frontend ────────────────────────────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: ../docker/Dockerfile.frontend
+      # NEXT_PUBLIC_* vars no longer needed at build time — API/WS URLs are
+      # derived at runtime from window.location.hostname so the same image
+      # works from any host (localhost, LAN IP, domain) without a rebuild.
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    depends_on:
+      - api
+
+volumes:
+  postgres_data:

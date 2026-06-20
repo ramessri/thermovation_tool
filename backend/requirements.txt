@@ -1,0 +1,53 @@
+# Core
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+pydantic==2.5.0
+pydantic-settings==2.1.0
+python-multipart==0.0.6
+
+# Database
+sqlalchemy==2.0.23
+alembic==1.12.1
+asyncpg==0.29.0
+psycopg2-binary==2.9.9
+
+# Celery + Redis
+celery==5.3.4
+redis==5.0.0
+
+# Async
+httpx==0.25.2
+aiofiles==23.2.1
+aiohttp==3.9.1
+nest-asyncio==1.5.8
+
+# Storage
+boto3==1.28.85
+requests==2.31.0
+
+# Vision / ML
+opencv-python-headless==4.9.0.80
+numpy==1.26.4
+scipy==1.13.1
+scikit-learn==1.5.1
+h5py==3.11.0
+Pillow==10.4.0
+
+# Photogrammetry
+pycolmap>=0.6.1
+open3d>=0.18.0
+laspy==2.5.4
+
+# Feature matching (GPU)
+kornia==0.7.3
+lightglue @ git+https://github.com/cvg/LightGlue.git@edb2b838efb2ecfe3f88097c5fad9887d95aedad
+
+# Zero-shot object detection (Grounding DINO) + LLaVA scene understanding + Depth Anything v2
+transformers>=4.40.0,<5.0.0
+bitsandbytes>=0.43.0,<0.45.0
+accelerate>=0.26.0
+einops>=0.7.0
+
+# Utils
+python-dotenv==1.0.0
+tqdm==4.66.5
