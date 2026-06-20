@@ -38,7 +38,7 @@ jobs:
       - name: Build
         uses: docker/build-push-action@v5
         with:
-          context: .
+          context: ./frontend
           file: docker/Dockerfile.frontend
           push: false
           cache-from: type=gha
