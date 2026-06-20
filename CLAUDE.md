@@ -1,8 +1,8 @@
 # Photogram — Claude Code orientation
 
-Single-phase photogrammetry pipeline: video → dense metric-scaled 3D point cloud
-with coverage heatmaps.  **Scale is automatic — derived from ArUco fiducial markers
-printed in the scene.**
+Photogrammetry pipeline across three scene modes (indoor_room · outdoor · object):
+video or photos → metric-scaled dense point cloud, mesh, and Gaussian splat.
+**Scale is automatic — derived from ArUco fiducial markers printed in the scene.**
 
 Three scan modes are supported, selected at project creation via `scene_type`:
 - `indoor_room` (default) — walk-through of an enclosed space

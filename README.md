@@ -8,7 +8,7 @@ The core question: **in a pipeline where the geometry is already handled by clas
 
 ## What this is
 
-A fully working indoor photogrammetry pipeline — video in, metric-scaled dense 3D point cloud out — built as a platform for running experiments. The pipeline is production-quality and runs end-to-end automatically, which is what makes it a useful testbed: results are comparable across approaches, and the cost of a failed experiment is just one pipeline run.
+A fully working photogrammetry pipeline across three scene modes — indoor room, outdoor survey, object orbit — built as a platform for running experiments. Video or photos in, metric-scaled dense point cloud, mesh, and Gaussian splat out. The pipeline is production-quality and runs end-to-end automatically, which is what makes it a useful testbed: results are comparable across approaches, and the cost of a failed experiment is just one pipeline run.
 
 The system went through several major phases of VLM integration before arriving at its current form. VLMs were explored for scene classification, scale-reference detection (Grounding DINO + LLaVA), depth map alignment (Depth Anything v2), and reconstruction quality validation.
 

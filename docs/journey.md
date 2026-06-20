@@ -154,7 +154,7 @@ The scale derivation becomes a clean geometric problem: triangulate each marker'
 - `fill_planes_task` (room layout, plane projection)
 - `refine_cloud_task` (SOR + voxel downsample)
 
-**Result:** The pipeline became fully automatic. Upload video, get a metric cloud. No user intervention. The first real end-to-end run with a properly placed marker sheet yielded scale accurate to ~2%.
+**Result:** The pipeline became fully automatic. Upload video or photos, get a metric-scaled point cloud, mesh, and Gaussian splat. No user intervention. The first real end-to-end run with a properly placed marker sheet yielded scale accurate to ~2%.
 
 ### What we kept
 
