@@ -79,6 +79,7 @@ export default function ProjectsPage() {
   const [newName, setNewName]           = useState('');
   const [newDesc, setNewDesc]           = useState('');
   const [newSceneType, setNewSceneType] = useState<'indoor_room' | 'outdoor' | 'object'>('indoor_room');
+  const [newLingbot, setNewLingbot]     = useState(false);
   const [creating, setCreating]         = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [selected, setSelected] = useState<Set<string>>(new Set());
@@ -113,7 +114,7 @@ export default function ProjectsPage() {
     if (!newName.trim()) return;
     try {
       setCreating(true);
-      const project = await createProject({ name: newName, description: newDesc, scene_type: newSceneType });
+      const project = await createProject({ name: newName, description: newDesc, scene_type: newSceneType, lingbot_enabled: newLingbot });
       router.push(`/projects/${project.id}`);
     } catch { setError('Failed to create project'); }
     finally { setCreating(false); }
@@ -231,6 +232,20 @@ export default function ProjectsPage() {
                   </button>
                 ))}
               </div>
+            </div>
+            <div>
+              <label className="flex items-start gap-2 cursor-pointer">
+                <input type="checkbox" checked={newLingbot}
+                  onChange={e => setNewLingbot(e.target.checked)}
+                  className="mt-0.5 h-4 w-4 rounded border-slate-300 text-brand-600 focus:ring-brand-500" />
+                <span className="text-sm text-slate-700">
+                  <span className="font-medium">✨ Densify with LingBot depth fusion</span>
+                  <span className="block text-xs text-slate-500">
+                    Adds a neural depth-fusion pass to fill gaps. Best for object/orbit and photo captures;
+                    continuous video walkthroughs benefit less.
+                  </span>
+                </span>
+              </label>
             </div>
             <div className="flex gap-3 pt-2">
               <button type="submit" disabled={creating || !newName.trim()}

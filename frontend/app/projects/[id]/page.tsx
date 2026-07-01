@@ -32,6 +32,8 @@ interface ProjectDetail {
   coverage_runs?: Array<{ ts: number; score: number; cloud_key: string; n_suggestions: number }> | null;
   splat_key?: string | null;
   mesh_key?: string | null;
+  lingbot_cloud_key?: string | null;
+  lingbot_mesh_key?: string | null;
   suggestions?: any[] | null;
   gravity_up_world?: number[] | null;
   pipeline_mode?: string | null;
@@ -1334,6 +1336,8 @@ export default function ProjectDetailPage() {
                 scaleFactor={project?.confirmed_scale_factor ?? 1}
                 splatKey={project?.splat_key}
                 gsMeshKey={project?.mesh_key}
+                lingbotCloudKey={project?.lingbot_cloud_key}
+                lingbotMeshKey={project?.lingbot_mesh_key}
                 objectLabels={[]}
                 apiBase={API_BASE}
               />

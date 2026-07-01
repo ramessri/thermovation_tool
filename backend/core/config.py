@@ -60,5 +60,24 @@ class Settings(BaseSettings):
     MAX_FRAMES_PER_VIDEO: int = 500
     FRAME_EXTRACTION_FPS: float = 2.0
 
+    # LingBot-Map depth fusion (optional densification stage — runs in an
+    # isolated torch-2.8 venv via subprocess; see CLAUDE.md). Off by default.
+    ENABLE_LINGBOT_FUSION: bool = False
+    LINGBOT_VENV_PYTHON: str = "/opt/lingbot-venv/bin/python"
+    LINGBOT_INFER_SCRIPT: str = "/app/backend/workers/pipeline/lingbot/infer_depth.py"
+    LINGBOT_CHECKPOINT: Path = Path("/app/models/lingbot/lingbot-map.pt")
+    LINGBOT_CHECKPOINT_REPO: str = "robbyant/lingbot-map"
+    LINGBOT_CHECKPOINT_FILE: str = "lingbot-map.pt"
+    # Memory knobs proven on a 12 GB GPU (RTX 4070 Ti).
+    LINGBOT_NUM_SCALE_FRAMES: int = 2
+    LINGBOT_CAMERA_ITERS: int = 1
+    LINGBOT_WINDOWED_THRESHOLD: int = 60    # >this uses bounded windowed mode (12 GB-safe; streaming KV peaks ~64 frames)
+    LINGBOT_WINDOW_SIZE: int = 24
+    LINGBOT_CONF_PERCENTILE: float = 40.0
+    # Cap frames fed to depth inference — long walkthroughs (1000+ frames) OOM
+    # even in windowed mode, and indoor coverage is highly redundant. Evenly
+    # subsample above this. ~300 views is ample for densification on a 12 GB GPU.
+    LINGBOT_MAX_FRAMES: int = 300
+
 
 settings = Settings()

@@ -21,6 +21,7 @@ class ProjectCreate(BaseModel):
     name: str
     description: str = ""
     scene_type: str = "indoor_room"   # "indoor_room" | "outdoor" | "object"
+    lingbot_enabled: bool = False     # opt-in to LingBot depth-fusion densification
 
 
 class ProjectUpdate(BaseModel):
@@ -53,6 +54,9 @@ class ProjectResponse(BaseModel):
     coverage_runs: list | None = None
     splat_key: str | None = None
     mesh_key: str | None = None
+    lingbot_cloud_key: str | None = None
+    lingbot_mesh_key: str | None = None
+    lingbot_enabled: bool = False
     aruco_markers: dict | None = None
     gravity_up_world: list | None = None
     calibration_data: dict | None = None
@@ -79,6 +83,7 @@ async def create_project(body: ProjectCreate, db: AsyncSession = Depends(get_db)
         description=body.description,
         scene_type=st,
         status=ProjectStatus.CREATED,
+        lingbot_enabled=body.lingbot_enabled,
     )
     db.add(project)
     await db.commit()
@@ -268,7 +273,7 @@ async def launch_pipeline(
         else:
             task = _launch_std(project_id, upload.storage_key, extra_keys=extra_keys,
                                 exclude_marker_ids=exclude_ids, resize_preset=resize_preset,
-                                scene_type=scene_type)
+                                scene_type=scene_type, lingbot_enabled=bool(project.lingbot_enabled))
 
         if not task or not task.id:
             raise HTTPException(500, "Failed to start pipeline")
@@ -535,13 +540,15 @@ async def delete_failed_projects(db: AsyncSession = Depends(get_db)):
 REPROCESS_CHAIN: dict[str, list[str]] = {
     "scale_from_aruco": [
         "scale_from_aruco", "apply_known_scale", "fill_planes",
-        "refine_cloud", "coverage", "export",
+        "refine_cloud", "lingbot_fusion", "coverage", "export",
     ],
-    "fill_planes": ["fill_planes", "refine_cloud", "coverage", "export"],
-    "refine_cloud": ["refine_cloud", "coverage", "export"],
+    "fill_planes": ["fill_planes", "refine_cloud", "lingbot_fusion", "coverage", "export"],
+    "refine_cloud": ["refine_cloud", "lingbot_fusion", "coverage", "export"],
+    "lingbot_fusion": ["lingbot_fusion", "coverage", "export"],
     "coverage":     ["coverage", "export"],
     "export":       ["export"],
 }
+# Note: "lingbot_fusion" is filtered out at dispatch unless ENABLE_LINGBOT_FUSION.
 
 
 @router.post("/{project_id}/reprocess")
@@ -567,7 +574,8 @@ async def reprocess(
     from celery import chain as _chain
     from backend.workers.tasks import (
         scale_from_aruco_task, apply_known_scale_task,
-        fill_planes_task, refine_cloud_task, analyze_coverage, export_outputs,
+        fill_planes_task, refine_cloud_task, lingbot_fusion_task,
+        analyze_coverage, export_outputs,
         _create_job_for_task,
     )
 
@@ -612,10 +620,15 @@ async def reprocess(
         "apply_known_scale": apply_known_scale_task,
         "fill_planes":       fill_planes_task,
         "refine_cloud":      refine_cloud_task,
+        "lingbot_fusion":    lingbot_fusion_task,
         "coverage":          analyze_coverage,
         "export":            export_outputs,
     }
-    tasks = [task_map[s].s(project_id) for s in REPROCESS_CHAIN[from_stage]]
+    # lingbot_fusion only runs when enabled for this project (env flag = master kill-switch).
+    _lingbot_on = settings.ENABLE_LINGBOT_FUSION and bool(getattr(project, "lingbot_enabled", False))
+    stage_seq = [s for s in REPROCESS_CHAIN[from_stage]
+                 if s != "lingbot_fusion" or _lingbot_on]
+    tasks = [task_map[s].s(project_id) for s in stage_seq]
 
     # Mark processing
     project.status = ProjectStatus.PROCESSING

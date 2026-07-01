@@ -81,6 +81,24 @@ RUN cd /opt && \
     pip install --no-build-isolation /opt/gaussian-splatting/submodules/simple-knn && \
     pip install plyfile
 
+# LingBot-Map (feed-forward depth model) — ISOLATED venv with torch 2.8/cu128.
+# Kept apart from the main env (torch 2.4.1/cu124) because pycolmap, LightGlue,
+# gaussian-splatting CUDA ext and MASt3R are all built against 2.4.1. Only the
+# depth-inference subprocess (backend/.../lingbot/infer_depth.py) uses this venv;
+# the fusion math runs in the main env. See CLAUDE.md.
+RUN apt-get update && apt-get install -y --no-install-recommends python3.10-venv && \
+    rm -rf /var/lib/apt/lists/*
+RUN cd /opt && \
+    git clone https://github.com/Robbyant/lingbot-map.git && \
+    cd lingbot-map && git checkout 7ae07810ddac6f449f856ca0f6260ab3e1dcaa84 && \
+    python3 -m venv /opt/lingbot-venv && \
+    /opt/lingbot-venv/bin/pip install --upgrade pip && \
+    /opt/lingbot-venv/bin/pip install torch==2.8.0 torchvision==0.23.0 \
+        --index-url https://download.pytorch.org/whl/cu128 && \
+    /opt/lingbot-venv/bin/pip install -e /opt/lingbot-map && \
+    /opt/lingbot-venv/bin/python -c "import torch,demo; print('lingbot venv torch', torch.__version__)"
+# Checkpoint (~4.6 GB) is lazy-downloaded at first stage run to /app/models/lingbot.
+
 # Pre-download LightGlue + DISK weights to /app/models so the worker doesn't
 # fetch them on first run.
 ENV TORCH_HOME=/app/models/torch
@@ -103,6 +121,11 @@ RUN python -c "import torch; from transformers import LlavaNextProcessor, LlavaN
 # Pre-download Depth Anything v2 Large weights for monocular depth fusion.
 RUN python -c "from transformers import AutoImageProcessor, AutoModelForDepthEstimation; AutoImageProcessor.from_pretrained('depth-anything/Depth-Anything-V2-Large-hf', cache_dir='/app/models/depth_anything'); AutoModelForDepthEstimation.from_pretrained('depth-anything/Depth-Anything-V2-Large-hf', cache_dir='/app/models/depth_anything'); print('Depth Anything v2 Large weights cached.')" \
     || echo "[warn] Depth Anything prefetch failed — will lazy-load at runtime"
+
+# onnxruntime for LingBot sky segmentation — late layer so the heavy HF weight
+# prefetches above stay cached on rebuild.
+RUN /opt/lingbot-venv/bin/pip install onnxruntime && \
+    /opt/lingbot-venv/bin/python -c "import onnxruntime; print('lingbot venv onnxruntime', onnxruntime.__version__)"
 
 COPY backend/ ./backend/
 COPY ml/ ./ml/

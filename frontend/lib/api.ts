@@ -39,6 +39,7 @@ export const createProject = (data: {
   name: string;
   description?: string;
   scene_type?: "indoor_room" | "outdoor" | "object";
+  lingbot_enabled?: boolean;
 }) => api.post("/api/projects/", data).then((r) => r.data);
 
 export const listProjects = () =>

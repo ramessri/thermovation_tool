@@ -79,6 +79,7 @@ celery_app.conf.update(
         "pipeline.sfm":               {"queue": "gpu"},
         "pipeline.mvs":               {"queue": "gpu"},
         "pipeline.gaussian_splatting": {"queue": "gpu"},
+        "pipeline.lingbot_fusion":    {"queue": "gpu"},
     },
 )
 
@@ -966,6 +967,52 @@ def refine_cloud_task(self, prev_result: dict, project_id: str) -> dict:
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+@celery_app.task(bind=True, name="pipeline.lingbot_fusion")
+def lingbot_fusion_task(self, prev_result: dict, project_id: str) -> dict:
+    """
+    Optional densification: fuse LingBot-Map depth maps into the COLMAP
+    reconstruction (per-frame affine calibration + TSDF) and emit a SEPARATE
+    densified cloud + mesh. Additive — does not alter dense_cloud_key. Depth
+    inference runs in an isolated torch-2.8 venv via subprocess.
+    """
+    from backend.workers.pipeline.lingbot_fusion import run_lingbot_fusion
+
+    job_id = self.request.id
+    tmp    = job_tmp(job_id)
+    t0     = _time.time()
+    hb     = start_heartbeat(project_id, "lingbot_fusion")
+    try:
+        scale = prev_result.get("confirmed_scale_factor")
+        update_job_status(job_id, JobStatus.RUNNING, 0.0, "Densifying with LingBot depth fusion…")
+        result = asyncio.run(
+            run_lingbot_fusion(
+                project_id, prev_result, tmp,
+                scale_factor=scale,
+                scene_type=prev_result.get("scene_type"),
+                progress_cb=make_progress_cb(project_id, "lingbot_fusion", job_id),
+            )
+        )
+        m = result.get("lingbot_fusion", {})
+        update_job_status(job_id, JobStatus.SUCCESS, 1.0,
+                          f"{m.get('fused_point_count',0):,} pts, {m.get('frames_used',0)} frames")
+        emit_stage_complete(project_id, "lingbot_fusion", t0,
+                            f"densified: {m.get('fused_point_count',0):,} pts, "
+                            f"{m.get('fused_mesh_tris',0):,} tris",
+                            metrics=m)
+        return result
+    except Exception as e:
+        # Additive/optional stage: never fail the whole pipeline on densification error.
+        logger.exception("[%s] lingbot_fusion failed (non-fatal): %s", project_id, e)
+        update_job_status(job_id, JobStatus.FAILED, error=str(e))
+        emit_stage_complete(project_id, "lingbot_fusion", t0,
+                            f"densification skipped (error): {e}",
+                            warnings=[str(e)])
+        return prev_result
+    finally:
+        hb.set()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 # ── Stage 8: Coverage Analysis ────────────────────────────────────────────────
 
 @celery_app.task(bind=True, name="pipeline.coverage")
@@ -1101,11 +1148,15 @@ def export_outputs(self, prev_result: dict, project_id: str) -> dict:
             })
             splat_key = result.get("splat_key")
             mesh_key  = result.get("mesh_key")
+            lingbot_cloud_key = result.get("lingbot_cloud_key")
+            lingbot_mesh_key  = result.get("lingbot_mesh_key")
             cur.execute(
                 "UPDATE projects SET status=%s::projectstatus, coverage_score=%s, "
-                "suggestions=%s, coverage_runs=%s, splat_key=%s, mesh_key=%s WHERE id=%s",
+                "suggestions=%s, coverage_runs=%s, splat_key=%s, mesh_key=%s, "
+                "lingbot_cloud_key=%s, lingbot_mesh_key=%s WHERE id=%s",
                 (final_status, coverage_score, _json.dumps(suggestions),
-                 _json.dumps(runs), splat_key, mesh_key, project_id),
+                 _json.dumps(runs), splat_key, mesh_key,
+                 lingbot_cloud_key, lingbot_mesh_key, project_id),
             )
             conn.commit()
             cur.close()
@@ -1212,7 +1263,7 @@ def scout_calibrate_task(self, prev_result: dict, project_id: str) -> dict:
 
 def launch_pipeline(project_id: str, storage_key: str, extra_keys: list | None = None,
                      exclude_marker_ids: list | None = None, resize_preset: str | None = None,
-                     scene_type: str | None = None):
+                     scene_type: str | None = None, lingbot_enabled: bool = False):
     """
     Kick off the full pipeline as a single continuous Celery chain.
 
@@ -1277,6 +1328,10 @@ def launch_pipeline(project_id: str, storage_key: str, extra_keys: list | None =
         # orbits and for outdoor terrain which is never flat.
         *([fill_planes_task.s(project_id)] if not is_object and not is_outdoor else []),
         refine_cloud_task.s(project_id),
+        # Optional LingBot densification — per-project opt-in, with the env flag
+        # as a fleet-wide master kill-switch.
+        *([lingbot_fusion_task.s(project_id)]
+          if (settings.ENABLE_LINGBOT_FUSION and lingbot_enabled) else []),
         analyze_coverage.s(project_id),
         export_outputs.s(project_id),
     ]
@@ -1305,10 +1360,18 @@ def launch_full_pipeline(project_id: str, storage_key: str, calibration: dict,
     from celery import chain
     import psycopg2 as _pg2
 
+    # Read per-project densify opt-in (scout→full path has no caller param).
+    lingbot_enabled = False
     # Mark project as starting full run
     try:
         conn = _pg2.connect(settings.DATABASE_URL.replace("postgresql+asyncpg://", "postgres://"))
         cur  = conn.cursor()
+        try:
+            cur.execute("SELECT lingbot_enabled FROM projects WHERE id=%s", (project_id,))
+            _row = cur.fetchone()
+            lingbot_enabled = bool(_row[0]) if _row else False
+        except Exception:
+            lingbot_enabled = False
         cur.execute("UPDATE projects SET status=%s, pipeline_mode=%s WHERE id=%s",
                     ("processing", "full", project_id))
         conn.commit(); cur.close(); conn.close()
@@ -1328,6 +1391,8 @@ def launch_full_pipeline(project_id: str, storage_key: str, calibration: dict,
         apply_known_scale_task.s(project_id),
         fill_planes_task.s(project_id),
         refine_cloud_task.s(project_id),
+        *([lingbot_fusion_task.s(project_id)]
+          if (settings.ENABLE_LINGBOT_FUSION and lingbot_enabled) else []),
         analyze_coverage.s(project_id),
         export_outputs.s(project_id),
     ]

@@ -119,6 +119,9 @@ class Project(Base):
     # Outputs
     splat_key        = Column(Text, nullable=True)   # 3DGS .splat for WebGL viewer
     mesh_key         = Column(Text, nullable=True)   # extracted mesh (OBJ/GLB)
+    lingbot_cloud_key = Column(Text, nullable=True)  # LingBot-densified fused cloud (PLY)
+    lingbot_mesh_key  = Column(Text, nullable=True)  # LingBot-densified fused mesh (OBJ)
+    lingbot_enabled   = Column(Boolean, nullable=False, server_default="false")  # per-project densify opt-in
 
     # Two-pass adaptive pipeline
     pipeline_mode    = Column(String(32), nullable=True)  # 'standard' | 'scout' | 'full'

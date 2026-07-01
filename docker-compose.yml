@@ -116,6 +116,8 @@ services:
       # DA-V2 depth fusion disabled: produces phantom camera-frustum geometry.
       # Re-enable once per-pixel confidence filtering is implemented.
       DEPTH_FUSION_ENABLED: "false"
+      # LingBot depth-fusion densification (optional, isolated torch-2.8 venv).
+      ENABLE_LINGBOT_FUSION: "true"
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:

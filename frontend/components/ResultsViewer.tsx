@@ -53,6 +53,8 @@ interface Props {
   scaleFactor?: number;
   splatKey?: string | null;
   gsMeshKey?: string | null;
+  lingbotCloudKey?: string | null;
+  lingbotMeshKey?: string | null;
   objectLabels?: ObjectLabel[];
   apiBase: string;
 }
@@ -186,12 +188,13 @@ function objLoader(url: string, meshSide: THREE.Side) {
 
 // ── Main exported component ───────────────────────────────────────────────────
 
-export function ResultsViewer({ projectId, exports = [], suggestions = [], scaleFactor = 1, splatKey, gsMeshKey, apiBase }: Props) {
+export function ResultsViewer({ projectId, exports = [], suggestions = [], scaleFactor = 1, splatKey, gsMeshKey, lingbotCloudKey, lingbotMeshKey, apiBase }: Props) {
   const [tab, setTab] = useState<Tab>('cloud');
   const [colorMode, setColorMode] = useState<ColorMode>('coverage');
   const [meshSide, setMeshSide] = useState<THREE.Side>(THREE.BackSide);  // default inside for rooms
   const [rgbSource, setRgbSource] = useState<'dense' | 'export'>('export');
-  const [meshSource, setMeshSource] = useState<'poisson' | 'gs'>('poisson');
+  const [meshSource, setMeshSource] = useState<'poisson' | 'gs' | 'lingbot'>('poisson');
+  const [cloudSource, setCloudSource] = useState<'colmap' | 'lingbot'>('colmap');
 
   const plyExport        = exports.find(e => e.key === `${projectId}/exports/output.ply`);
   const objExport        = exports.find(e => e.key.endsWith('.obj'));
@@ -204,12 +207,18 @@ export function ResultsViewer({ projectId, exports = [], suggestions = [], scale
     confidence: confidenceExport ? storageUrl(apiBase, confidenceExport.key) : null,
     semantic:   semanticExport   ? storageUrl(apiBase, semanticExport.key)   : null,
   };
-  const activeCloudUrl = cloudUrlByMode[colorMode] ?? cloudUrlByMode['coverage'];
+  const lingbotCloudUrl = lingbotCloudKey ? storageUrl(apiBase, lingbotCloudKey) : null;
+  const lingbotMeshUrl  = lingbotMeshKey  ? storageUrl(apiBase, lingbotMeshKey)  : null;
+  const activeCloudUrl = (cloudSource === 'lingbot' && lingbotCloudUrl)
+    ? lingbotCloudUrl
+    : (cloudUrlByMode[colorMode] ?? cloudUrlByMode['coverage']);
 
   const poissonUrl   = objExport  ? storageUrl(apiBase, objExport.key)  : null;
   const gsMeshUrl    = gsMeshKey  ? storageUrl(apiBase, gsMeshKey)       : null;
   const hasBothMeshes = !!(poissonUrl && gsMeshUrl);
-  const objUrl       = meshSource === 'gs' && gsMeshUrl ? gsMeshUrl : (poissonUrl ?? gsMeshUrl);
+  const objUrl       = meshSource === 'lingbot' && lingbotMeshUrl ? lingbotMeshUrl
+                     : meshSource === 'gs' && gsMeshUrl ? gsMeshUrl
+                     : (poissonUrl ?? gsMeshUrl ?? lingbotMeshUrl);
   const sparseUrl    = storageUrl(apiBase, `${projectId}/sfm/sparse.ply`);
   const coverageUrl  = storageUrl(apiBase, `${projectId}/coverage/cloud_colored.ply`);
   const camerasUrl   = storageUrl(apiBase, `${projectId}/sfm/cameras.json`);
@@ -254,20 +263,32 @@ export function ResultsViewer({ projectId, exports = [], suggestions = [], scale
         {/* Mesh controls */}
         {tab === 'mesh' && (
           <div className="ml-2 flex items-center gap-1.5">
-            {hasBothMeshes && (
+            {(hasBothMeshes || lingbotMeshUrl) && (
               <div className="flex rounded border border-slate-600 overflow-hidden text-xs">
-                <button
-                  onClick={() => setMeshSource('poisson')}
-                  className={`px-2 py-1 transition-colors ${meshSource === 'poisson' ? 'bg-brand-600 text-white' : 'text-slate-400 hover:text-white hover:bg-slate-700'}`}
-                >
-                  Dense Cloud
-                </button>
-                <button
-                  onClick={() => setMeshSource('gs')}
-                  className={`px-2 py-1 transition-colors ${meshSource === 'gs' ? 'bg-brand-600 text-white' : 'text-slate-400 hover:text-white hover:bg-slate-700'}`}
-                >
-                  Gaussian Splat
-                </button>
+                {poissonUrl && (
+                  <button
+                    onClick={() => setMeshSource('poisson')}
+                    className={`px-2 py-1 transition-colors ${meshSource === 'poisson' ? 'bg-brand-600 text-white' : 'text-slate-400 hover:text-white hover:bg-slate-700'}`}
+                  >
+                    Dense Cloud
+                  </button>
+                )}
+                {gsMeshUrl && (
+                  <button
+                    onClick={() => setMeshSource('gs')}
+                    className={`px-2 py-1 transition-colors ${meshSource === 'gs' ? 'bg-brand-600 text-white' : 'text-slate-400 hover:text-white hover:bg-slate-700'}`}
+                  >
+                    Gaussian Splat
+                  </button>
+                )}
+                {lingbotMeshUrl && (
+                  <button
+                    onClick={() => setMeshSource('lingbot')}
+                    className={`px-2 py-1 transition-colors ${meshSource === 'lingbot' ? 'bg-brand-600 text-white' : 'text-slate-400 hover:text-white hover:bg-slate-700'}`}
+                  >
+                    Densified
+                  </button>
+                )}
               </div>
             )}
             <button
@@ -291,8 +312,11 @@ export function ResultsViewer({ projectId, exports = [], suggestions = [], scale
           </div>
         )}
 
+        {/* Cloud source toggle is rendered as an overlay on the canvas (below),
+            not here — the tab bar is too crowded and clipped it. */}
+
         {/* Colour-mode dropdown (Point Cloud tab only, when alternates exist) */}
-        {tab === 'cloud' && hasAlternateColors && (
+        {tab === 'cloud' && cloudSource === 'colmap' && hasAlternateColors && (
           <div className="ml-2 flex items-center gap-1">
             <span className="text-xs text-slate-500">Color:</span>
             <select
@@ -309,7 +333,11 @@ export function ResultsViewer({ projectId, exports = [], suggestions = [], scale
 
         {/* Download buttons pushed to the right */}
         <div className="ml-auto flex items-center gap-1 pr-2">
-          {[plyExport, objExport, lasExport, gsMeshKey ? { key: gsMeshKey, label: 'GS Mesh (.obj)', mime_type: 'model/obj' } : null].filter(Boolean).map(ex => ex && (
+          {[plyExport, objExport, lasExport,
+            gsMeshKey ? { key: gsMeshKey, label: 'GS Mesh (.obj)', mime_type: 'model/obj' } : null,
+            lingbotCloudKey ? { key: lingbotCloudKey, label: 'Densified Cloud (.ply)', mime_type: 'model/ply' } : null,
+            lingbotMeshKey ? { key: lingbotMeshKey, label: 'Densified Mesh (.obj)', mime_type: 'model/obj' } : null,
+          ].filter(Boolean).map(ex => ex && (
             <a
               key={ex.key}
               href={storageUrl(apiBase, ex.key)}
@@ -327,10 +355,31 @@ export function ResultsViewer({ projectId, exports = [], suggestions = [], scale
       {/* Viewer area */}
       <div style={{ height: tab === 'objects' ? 'auto' : '28rem' }}>
         {tab === 'cloud' && activeCloudUrl && (
-          <ThreeCanvas key={`cloud-${colorMode}`} loader={plyLoader(activeCloudUrl)} />
+          <div className="relative h-full">
+            {lingbotCloudUrl && (
+              <div className="absolute top-2 left-2 z-10 flex rounded border border-slate-600 overflow-hidden text-xs shadow-lg">
+                <button
+                  onClick={() => setCloudSource('colmap')}
+                  className={`px-3 py-1.5 transition-colors ${cloudSource === 'colmap' ? 'bg-brand-600 text-white' : 'bg-slate-900/90 text-slate-300 hover:text-white hover:bg-slate-700'}`}
+                >
+                  COLMAP
+                </button>
+                <button
+                  onClick={() => setCloudSource('lingbot')}
+                  className={`px-3 py-1.5 transition-colors ${cloudSource === 'lingbot' ? 'bg-brand-600 text-white' : 'bg-slate-900/90 text-slate-300 hover:text-white hover:bg-slate-700'}`}
+                >
+                  Densified
+                </button>
+              </div>
+            )}
+            <ThreeCanvas key={`cloud-${colorMode}-${cloudSource}`} loader={plyLoader(activeCloudUrl)} />
+          </div>
         )}
         {tab === 'mesh' && objUrl && (
-          <ThreeCanvas key={`mesh-${meshSide}-${meshSource}`} loader={objLoader(objUrl, meshSide)} />
+          <ThreeCanvas
+            key={`mesh-${meshSide}-${meshSource}`}
+            loader={objLoader(objUrl, meshSource === 'lingbot' ? THREE.DoubleSide : meshSide)}
+          />
         )}
         {tab === 'rgb' && (
           <ThreeCanvas key={`rgb-${rgbSource}`} loader={plyLoader(rgbUrl)} />

@@ -28,6 +28,7 @@ Single continuous chain — no user gate.  Stages marked ✦ are conditional on 
 | Apply scale | `pipeline.apply_known_scale` | cpu | open3d | all | scales dense cloud to metric |
 | Fill planes ✦ | `pipeline.fill_planes` | cpu | open3d | indoor only | skipped for outdoor (terrain not flat) and object (no floor concept) |
 | Refine cloud | `pipeline.refine_cloud` | cpu | open3d | all | SOR outlier removal + voxel downsampling; object mode uses finer voxel (1.5 mm vs 3 mm) |
+| LingBot fusion ✦ | `pipeline.lingbot_fusion` | gpu | LingBot-Map + open3d TSDF | all (flagged) | **optional, off by default** (`ENABLE_LINGBOT_FUSION`). Densifies via depth fusion; **additive** — emits `lingbot_cloud_key`/`lingbot_mesh_key`, does not alter `dense_cloud_key`. Depth inference runs in an isolated torch-2.8 venv via subprocess |
 | Coverage | `pipeline.coverage` | cpu | open3d HPR + DBSCAN | all | boundary clip and suggestions vary by scene_type (see below) |
 | Export | `pipeline.export` | cpu | laspy, open3d | all | |
 
@@ -104,6 +105,8 @@ Added to `projects` table. Populated by `emit_stage_complete()` after every stag
 - `backend/workers/pipeline/scout_calibrate.py` — scout calibration + full pipeline launch
 - `backend/workers/pipeline/room_layout.py` — gravity-aware floor plane projection + void fill (called by fill_planes task)
 - `backend/workers/pipeline/refine_cloud.py` — SOR outlier removal + voxel downsampling
+- `backend/workers/pipeline/lingbot_fusion.py` — optional densification stage: per-frame affine depth calibration + TSDF fusion (runs in main env; calls the inference subprocess)
+- `backend/workers/pipeline/lingbot/infer_depth.py` — LingBot depth inference, runs in the isolated `/opt/lingbot-venv` (torch 2.8); **never imported by the worker**, file-path subprocess only
 - `backend/workers/pipeline/aruco_detector.py` — ArUco detection + baseline measurement
 - `backend/workers/pipeline/matcher.py` — LightGlue feature matching
 - `backend/workers/pipeline/sfm.py` — pycolmap SfM with focal prior injection
@@ -168,6 +171,9 @@ Celery uses `acks_early` — tasks are acknowledged before execution. If the wor
 **`scene_type` lost in reprocess chains.**
 The `/reprocess` endpoint reads from the checkpoint (detect_aruco_sfm output). The checkpoint may not carry `scene_type`. Both `analyze_coverage` and `export_outputs` tasks now read `scene_type` from the DB as fallback. Same pattern for `confirmed_scale_factor` in the exporter.
 
+**LingBot fusion runs in an ISOLATED venv — never import `lingbot` in the worker.**
+The main worker env is torch 2.4.1/cu124 (pycolmap, LightGlue, gaussian-splatting CUDA ext, MASt3R all built against it). LingBot-Map needs torch 2.8/cu128, installed separately in `/opt/lingbot-venv` with the repo at `/opt/lingbot-map` (pinned commit). The stage (`lingbot_fusion.py`) does only numpy/open3d/scipy and shells out to `/opt/lingbot-venv/bin/python .../infer_depth.py` for depth inference — importing the `lingbot` package in the worker would clash torch ABIs. The fusion stage is **non-fatal**: on error it logs and returns `prev_result` so the pipeline still completes. The ~4.6 GB checkpoint lazy-downloads to `/app/models/lingbot/` on first run. Default off — set `ENABLE_LINGBOT_FUSION=1` to enable. Memory knobs match the 12 GB-GPU defaults proven earlier (windowed mode >120 frames, `num_scale_frames=2`, `camera_num_iterations=1`).
+
 ## Running the smoke harness
 
 All stages run inside `worker-gpu`:
@@ -227,3 +233,8 @@ WebSocket progress events are published to `project:{project_id}:progress` on Re
 | `ARUCO_MIN_FRAMES` | `2` | Minimum frames a marker must appear in to be trusted |
 | `ARUCO_FLOOR_MARKER_ID` | lowest ID | Which marker is on the floor (for gravity alignment) |
 | `GSPLAT_ITERATIONS` | `15000` | 3DGS training iterations (used in object chain after MVS) |
+| `ENABLE_LINGBOT_FUSION` | `false` | Enable the optional LingBot depth-fusion densification stage |
+| `LINGBOT_CHECKPOINT` | `/app/models/lingbot/lingbot-map.pt` | Checkpoint path (lazy-downloaded on first run) |
+| `LINGBOT_WINDOWED_THRESHOLD` | `120` | Frame count above which depth inference uses windowed mode |
+| `LINGBOT_MAX_FRAMES` | `300` | Cap on frames fed to depth inference; long walkthroughs (1000+) OOM even windowed, so evenly subsample above this |
+| `LINGBOT_CONF_PERCENTILE` | `40` | Drop this %% of lowest-confidence depth pixels before fusion |
