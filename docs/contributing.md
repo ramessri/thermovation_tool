@@ -9,8 +9,8 @@
 **Prerequisites:** Docker with CUDA CDI support, a GPU with ≥ 12 GB VRAM, `docker compose` v2.
 
 ```bash
-git clone https://github.com/N0t4R0b0t/photogram
-cd photogram
+git clone https://github.com/ramessri/thermovation_tool
+cd thermovation_tool
 cp .env.example .env          # adjust DATABASE_URL / REDIS_URL / storage if needed
 docker compose up --build -d
 docker compose exec api alembic upgrade head

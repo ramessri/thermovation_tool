@@ -9,8 +9,12 @@ visible in the video.
 Scale is stored in the result dict and in the projects table so Phase 2
 can apply it automatically — no user confirmation gate.
 
-FAIL FAST: if no markers are found in any frame, the task raises an error
-and the pipeline halts immediately (before the expensive COLMAP stages).
+Each project chooses its scale fiducial (projects.marker_type):
+  "aruco" — ArUco markers only (behaviour unchanged)
+  "grid"  — the custom 3×3 grid marker sheet only (grid_marker_detector.py)
+
+FAIL FAST: if the chosen marker is not found, the task raises an error and
+the pipeline halts immediately (before the expensive COLMAP stages).
 
 Environment variables
 ---------------------
@@ -171,9 +175,10 @@ async def run_aruco_detection(
     video_metadata: dict,
     tmp: Path,
     progress_cb: Callable[[float, str], None],
+    marker_type: str = "aruco",
 ) -> dict:
     """
-    Detect ArUco markers in extracted frames.
+    Detect the project's scale markers (ArUco or 3×3 grid) in extracted frames.
 
     Returns:
         {
@@ -183,12 +188,18 @@ async def run_aruco_detection(
           "aruco_marker_size_m": float,
           "aruco_frames_checked": int,
           "aruco_floor_marker_id": int | None,
+          "marker_type":       "aruco" | "grid",
+          "grid_markers":      dict — grid detections by sampled frame index (grid mode),
+          "grid_frames_found": int,
         }
 
-    Raises RuntimeError if no markers found (fail fast).
+    Raises RuntimeError if the chosen marker is not found (fail fast).
     """
     from backend.core.storage import get_storage
+    from backend.workers.pipeline.grid_marker_detector import detect_marker
     storage = get_storage()
+    use_grid = marker_type == "grid"
+    marker_label = "grid marker" if use_grid else "ArUco markers"
 
     # Camera matrix from metadata (or reasonable default)
     fl = video_metadata.get("focal_length_px")
@@ -209,16 +220,17 @@ async def run_aruco_detection(
     step          = max(1, len(frame_keys) // 150)
     sampled_keys  = frame_keys[::step]
     n_sampled     = len(sampled_keys)
-    progress_cb(0.05, f"Scanning {n_sampled} frames for ArUco markers…")
+    progress_cb(0.05, f"Scanning {n_sampled} frames for {marker_label}…")
 
     detections_by_frame: dict[int, list[dict]] = {}
     marker_frame_count: dict[int, int] = {}
+    grid_by_frame: dict[str, dict] = {}
     camera_matrix: np.ndarray | None = None
 
     for i, key in enumerate(sampled_keys):
         if i % 20 == 0:
             progress_cb(0.05 + 0.80 * i / n_sampled,
-                        f"ArUco scan {i+1}/{n_sampled}…")
+                        f"{marker_label} scan {i+1}/{n_sampled}…")
 
         local = tmp / f"aruco_frame_{i:04d}.jpg"
         try:
@@ -245,6 +257,16 @@ async def run_aruco_detection(
                     scale, frame_w, frame_h, w, h,
                 )
 
+        if use_grid:
+            try:
+                grid = detect_marker(img)
+            except Exception as e:
+                logger.debug("Grid marker: detection error on %s: %s", key, e)
+                grid = None
+            if grid is not None:
+                grid_by_frame[str(i)] = grid
+            continue
+
         dets = detect_markers_in_frame(img, camera_matrix, dist_coeffs)
         if dets:
             detections_by_frame[i] = dets
@@ -252,6 +274,29 @@ async def run_aruco_detection(
                 marker_frame_count[d["id"]] = marker_frame_count.get(d["id"], 0) + 1
 
     progress_cb(0.85, "Analysing detections…")
+
+    if use_grid:
+        logger.info("Grid marker: found in %d/%d sampled frames", len(grid_by_frame), n_sampled)
+        if len(grid_by_frame) < ARUCO_MIN_FRAMES:
+            raise RuntimeError(
+                f"Grid marker found in {len(grid_by_frame)} frame(s); need {ARUCO_MIN_FRAMES}+. "
+                "Place the printed 3×3 grid marker sheet (28.6 × 20.2 cm) flat in the scene and "
+                "keep it clearly visible from several viewpoints. "
+                "(Or create the project with ArUco markers selected.)"
+            )
+        progress_cb(1.0, f"Grid marker found in {len(grid_by_frame)} frames")
+        return {
+            "marker_type":           "grid",
+            "aruco_markers":         {},
+            "aruco_ids_found":       [],
+            "aruco_baselines":       [],
+            "aruco_marker_size_m":   ARUCO_MARKER_SIZE_M,
+            "aruco_frames_checked":  n_sampled,
+            "aruco_floor_marker_id": None,
+            "aruco_sampled_keys":    sampled_keys,
+            "grid_markers":          grid_by_frame,
+            "grid_frames_found":     len(grid_by_frame),
+        }
 
     # Filter: only keep markers seen in ARUCO_MIN_FRAMES+ frames
     reliable_ids = {mid for mid, cnt in marker_frame_count.items()
@@ -304,6 +349,7 @@ async def run_aruco_detection(
     progress_cb(1.0, f"ArUco: {len(reliable_ids)} markers found — IDs {sorted(reliable_ids)}")
 
     return {
+        "marker_type":          "aruco",
         "aruco_markers":        serialisable,
         "aruco_ids_found":      sorted(reliable_ids),
         "aruco_baselines":      baselines if baselines else [],

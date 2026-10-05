@@ -27,23 +27,10 @@ from typing import Callable, Optional
 import numpy as np
 
 from backend.core.config import settings
+from backend.workers.pipeline.depth_fusion_common import robust_affine
 
 logger = logging.getLogger(__name__)
 
-
-def _robust_affine(dl: np.ndarray, zc: np.ndarray, iters: int = 4):
-    """Fit zc ~ a*dl + b robustly (trimmed least squares). Returns (a, b, inlier_frac)."""
-    m = np.ones(len(dl), bool)
-    a, b = 1.0, 0.0
-    for _ in range(iters):
-        if m.sum() < 30:
-            break
-        A = np.vstack([dl[m], np.ones(m.sum())]).T
-        (a, b), *_ = np.linalg.lstsq(A, zc[m], rcond=None)
-        resid = np.abs(a * dl + b - zc)
-        thr = 2.5 * np.median(resid[m]) + 1e-9
-        m = resid < thr
-    return a, b, float(m.mean())
 
 
 def _ensure_checkpoint() -> Path:
@@ -163,7 +150,7 @@ def _fuse(frames_npz: Path, cameras_json: Path, dense_ply: Path,
             dl = depth[i][v[inb].astype(int), u[inb].astype(int)]
             zc = z[inb]; ok = dl > 1e-3
             if ok.sum() > 50:
-                a_i, b_i, frac = _robust_affine(dl[ok], zc[ok])
+                a_i, b_i, frac = robust_affine(dl[ok], zc[ok])
         if a_i is None or not np.isfinite(a_i) or frac < 0.4:
             skipped += 1
             continue
@@ -326,7 +313,7 @@ async def run_lingbot_fusion(
     # 3-5. Affine calibration + TSDF fusion + floater removal (main env)
     progress_cb(0.5, "Calibrating depth and fusing (TSDF)…")
     pcd, mesh, metrics = _fuse(frames_npz, cameras_json, dense_ply, progress_cb,
-                               scene_type=scene_type or "object")
+                               scene_type=scene_type or "indoor_room")  # project default; "object" would orbit-clip a room away
 
     # 6. Scale to metric (same convention as apply_known_scale: metric = sfm * factor)
     if scale_factor and scale_factor > 0:

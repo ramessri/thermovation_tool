@@ -475,14 +475,14 @@ async def run_scale_from_aruco(
     # Passed via prev_result["exclude_marker_ids"] = [7, 12, ...]
     _exclude_ids: set[int] = set(prev_result.get("exclude_marker_ids") or [])
     """
-    Post-SfM scale derivation from ArUco markers.
+    Post-SfM scale derivation from ArUco markers and/or the 3×3 grid marker.
 
     Uses the ArUco detections from the detect_aruco stage and the
     COLMAP camera poses to derive a metric scale factor.
 
     Returns prev_result augmented with:
         confirmed_scale_factor  float | None
-        confirmed_scale_source  "aruco"
+        confirmed_scale_source  "aruco" | "grid_marker"
         gravity_up_world        [x,y,z] | None
         scale_diagnostics       dict
     """
@@ -503,16 +503,31 @@ async def run_scale_from_aruco(
         result = dict(prev_result)
         result.update({
             "confirmed_scale_factor": None,
-            "confirmed_scale_source": "aruco",
+            "confirmed_scale_source": "grid_marker" if aruco_result.get("marker_type") == "grid" else "aruco",
             "gravity_up_world":       None,
             "scale_diagnostics":      {"error": str(e)},
         })
         return result
 
-    n_sfm_markers = len(aruco_result.get("aruco_markers_sfm", {}))
-    source_note = f" (post-SfM: {n_sfm_markers} registered frames)" if n_sfm_markers else " (pre-SfM fallback)"
-    progress_cb(0.3, f"Triangulating ArUco markers from SfM cameras{source_note}…")
-    scale_factor, diagnostics = derive_scale_factor(aruco_result, cameras_json, exclude_ids=_exclude_ids)
+    is_grid = aruco_result.get("marker_type") == "grid"
+    scale_source = "grid_marker" if is_grid else "aruco"
+
+    if is_grid:
+        from backend.workers.pipeline.grid_marker_scale import derive_grid_scale
+        grid_dets = aruco_result.get("grid_markers_sfm") or {}
+        progress_cb(0.3, f"Triangulating grid marker from {len(grid_dets)} frame(s)…")
+        try:
+            scale_factor, diagnostics = derive_grid_scale(grid_dets, cameras_json)
+        except Exception as e:
+            logger.warning("[%s] scale_from_aruco: grid scale failed: %s", project_id, e)
+            scale_factor, diagnostics = None, {"error": str(e)}
+        diagnostics["strategy"] = "grid_marker_similarity_fit"
+    else:
+        n_sfm_markers = len(aruco_result.get("aruco_markers_sfm", {}))
+        source_note = f" (post-SfM: {n_sfm_markers} registered frames)" if n_sfm_markers else " (pre-SfM fallback)"
+        progress_cb(0.3, f"Triangulating ArUco markers from SfM cameras{source_note}…")
+        scale_factor, diagnostics = derive_scale_factor(aruco_result, cameras_json, exclude_ids=_exclude_ids)
+    diagnostics["scale_source"] = scale_source
 
     # Sanitize: numpy returns nan for mean/std of empty arrays — treat as None
     import math as _math
@@ -559,7 +574,7 @@ async def run_scale_from_aruco(
             if scale_factor is not None:
                 cur.execute(
                     "UPDATE projects SET confirmed_scale_factor=%s, confirmed_scale_source=%s WHERE id=%s",
-                    (scale_factor, "aruco", project_id),
+                    (scale_factor, scale_source, project_id),
                 )
                 logger.info("[%s] scale_from_aruco: scale=%.6f persisted", project_id, scale_factor)
             if gravity_list is not None:
@@ -583,7 +598,7 @@ async def run_scale_from_aruco(
     result = dict(prev_result)
     result.update({
         "confirmed_scale_factor": scale_factor,
-        "confirmed_scale_source": "aruco",
+        "confirmed_scale_source": scale_source,
         "gravity_up_world":       gravity_list,
         "scale_diagnostics":      diagnostics,
         "fitted_planes":          fitted_planes,

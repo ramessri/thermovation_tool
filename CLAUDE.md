@@ -2,7 +2,7 @@
 
 Photogrammetry pipeline across three scene modes (indoor_room · outdoor · object):
 video or photos → metric-scaled dense point cloud, mesh, and Gaussian splat.
-**Scale is automatic — derived from ArUco fiducial markers printed in the scene.**
+**Scale is automatic — derived from printed fiducials in the scene: ArUco markers or the custom 3×3 grid marker (chosen per project via `marker_type`).**
 
 Three scan modes are supported, selected at project creation via `scene_type`:
 - `indoor_room` (default) — walk-through of an enclosed space
@@ -29,10 +29,33 @@ Single continuous chain — no user gate.  Stages marked ✦ are conditional on 
 | Fill planes ✦ | `pipeline.fill_planes` | cpu | open3d | indoor only | skipped for outdoor (terrain not flat) and object (no floor concept) |
 | Refine cloud | `pipeline.refine_cloud` | cpu | open3d | all | SOR outlier removal + voxel downsampling; object mode uses finer voxel (1.5 mm vs 3 mm) |
 | LingBot fusion ✦ | `pipeline.lingbot_fusion` | gpu | LingBot-Map + open3d TSDF | all (flagged) | **optional, off by default** (`ENABLE_LINGBOT_FUSION`). Densifies via depth fusion; **additive** — emits `lingbot_cloud_key`/`lingbot_mesh_key`, does not alter `dense_cloud_key`. Depth inference runs in an isolated torch-2.8 venv via subprocess |
+| MetricAnything fusion ✦ | `pipeline.metricanything_fusion` | gpu | MetricAnything + open3d TSDF | all video (flagged) | **optional, off by default** (`ENABLE_METRICANYTHING_FUSION` + per-project `metricanything_enabled`). Same additive role as LingBot — emits `metricanything_cloud_key`/`metricanything_mesh_key`. Runs **in-process** (torch<2.5 requirement met by 2.4.1) |
+| HVAC placement ✦ (4 stages) | `pipeline.wall_plane_detection` → `detect_hvac_fixtures` → `locate_rucklauf` → `hvac_placement` | gpu | SegFormer/ADE20K, GDINO, SAM2, open3d | indoor only (flagged) | **optional, off by default** (`ENABLE_HVAC_PLACEMENT` + per-project `hvac_mode`). Non-fatal. See "HVAC placement" below |
 | Coverage | `pipeline.coverage` | cpu | open3d HPR + DBSCAN | all | boundary clip and suggestions vary by scene_type (see below) |
 | Export | `pipeline.export` | cpu | laspy, open3d | all | |
 
 Pipeline starts at `processing` and ends at `complete` or `needs_more`.
+
+### HVAC placement (indoor_room, opt-in)
+
+Recommends where to mount a wall unit (`HVAC_UNIT_SIZE_CM`, default 60×40), anchored on the Rücklauf. All four stages work in the metric frame of the refined cloud; camera poses come from `depth_fusion_common.load_registered_cameras(..., scale_factor=confirmed_scale_factor)` so `t` matches. 2D detections are lifted to 3D by projecting the dense cloud into the frame (`hvac_common.points_in_box/points_in_mask`), not by ray triangulation.
+1. **Walls** — SegFormer/ADE20K wall masks on ≤`HVAC_MAX_WALL_SEG_FRAMES` frames select the cloud points; RANSAC (`room_layout._ransac_plane`) fits ≤6 planes on only those; hard gate ≤25° from vertical; dedup; green photo overlays per top-3 wall.
+2. **Fixtures** — one GDINO pass (pipe, valve, radiator, outlet, window, return/supply pipe), SAM2 mask refinement (box fallback if SAM2 won't load), ≥20 points per detection, DBSCAN (0.30 m) into instances with `best_frame` + `best_box_frac`.
+3. **Rücklauf / Vorlauf** — blue / red cap colour cues (HSV), else the best GDINO "return/supply pipe" instance; snaps to a pipe cluster within 40 cm. None → free-wall mode.
+4. **Placement** — walls must clear `HVAC_MIN_WALL_INLIERS` and `HVAC_MIN_ADE20K_CONFIDENCE`; grid search with fixture keep-outs (0.15 m) and `HVAC_MIN_CLEARANCE_CM`; score = distance to Rücklauf (or −clearance). Top 5 keep `corners_world_m`. Rank 1 is drawn on the largest clean (`quad_is_clean`), unoccluded (`_is_occluded`) photo. **No minimum mounting height** — a low Rücklauf pulls rank 1 to the floor line (and such a spot then gets no photo overlay, since the floor corner occludes it).
+
+Results: `projects.hvac_placement` + `projects.hvac_segmentation` (export; kept via COALESCE on reprocess). UI: **Segmentation** tab (`HvacSegmentationViewer.tsx` — photos with overlays) and a **Show placement** toggle on the Point Cloud / Mesh tabs (`lib/hvacOverlay.ts`): rank 1 filled green, ranks 2–5 amber outlines, Rücklauf blue, Vorlauf red, fixtures as dots. The overlay is added as a child of the loaded cloud/mesh so it shares the viewer's re-centring and COLMAP→Three.js flip; it's only shown on metric-frame views (export cloud/mesh, densified clouds), not the RGB tab's raw MVS cloud. Floor height for `mount_height_cm` comes from `fitted_planes` (ArUco floor marker) — grid-marker scans get `None`.
+
+### LiDAR ingestion (`scan_source="lidar_ply"`)
+
+Alternate chain for an already-built `.ply` point cloud (chosen per launch in the UI's "Scan source" selector; `POST /launch?scan_source=lidar_ply&lidar_scale_factor=…`):
+`ingest_lidar_ply` → `refine_cloud` → `export` (`launch_lidar_pipeline` in `tasks.py`). No camera poses, so no markers, coverage, or densifier.
+- **Scale:** trusted from the scanner (metres); `lidar_scale_factor` multiplies through otherwise (e.g. `0.001` for mm). Rescaled cloud → `{pid}/lidar/ingested.ply`, `confirmed_scale_factor=1.0`, source `lidar_native` / `lidar_manual`.
+- **Gravity:** `dimensions.detect_floor_gravity` — iterative RANSAC (≤8 planes, 2 cm, ≥2000 inliers), group normals within 12°, vertical = group with the **smallest** cloud extent (a room is wider than tall; "largest plane = floor" fails when a clean wall out-votes a cluttered floor). Skipped for `object`. Wrong for tall narrow spaces (stairwells).
+
+### Dimensions (L × B × H)
+
+Every input path ends with dimensions — ArUco video, grid-marker video, and LiDAR. `export` computes them whenever the cloud is metric (`confirmed_scale_factor` set) and the scene isn't `object`. "Up" comes from the ArUco floor marker or LiDAR ingest; otherwise `dimensions.detect_floor_gravity` finds it from the cloud's own floor (same algorithm as LiDAR ingest). If marker scale couldn't be derived the cloud is in SfM units, so no dimensions are reported. SOR → rotate up to +Z → H = 0.5–99.5 pct vertical extent, L/B = `cv2.minAreaRect` of the footprint. Optional tape-measure `ground_truth_{length,breadth,height}_m` at launch (or `/reprocess?from_stage=export`) adds `ground_truth_check` with per-field error %. Stored in `projects.dimensions` (+ `pipeline_results.export.dimensions`); shown by `frontend/components/DimensionsCard.tsx` in the completion card. Furniture / scan bleed through doors inflates L/B (only H is percentile-clipped).
 Coverage threshold for `needs_more`: **80 %** for object, **50 %** for indoor and outdoor.
 
 ### Coverage boundary per scene type
@@ -47,6 +70,12 @@ Shot suggestions use scene-aware labels:
 - indoor: "floor", "ceiling", "+X wall" etc.
 - object: object-relative labels ("top", "lower front-right side", "back") derived from cluster centroid vs object center + gravity
 - outdoor: "ground/terrain surface", "upper/overhead surface"
+
+### Scale marker choice (`marker_type`)
+
+Chosen in the UI at project creation (`projects.marker_type`, alembic 013):
+- `aruco` (default) — everything in "ArUco requirement" below.
+- `grid` — custom 3×3 grid sheet: 28.6 × 20.2 cm, 9 black 3.9 cm squares, centres 12.35 cm apart horizontally / 8.15 cm vertically. `detect_aruco` / `detect_aruco_sfm` run `grid_marker_detector.detect_marker()` instead of ArUco (same stage names); fail fast if the board is seen in < `ARUCO_MIN_FRAMES` frames. `scale_from_aruco` triangulates the 9 square centres from SfM cameras and fits a similarity transform to the known layout (`grid_marker_scale.py`) → `confirmed_scale_source = "grid_marker"`. No floor-marker gravity or marker-fitted floor plane in grid mode.
 
 ### ArUco requirement
 
@@ -106,16 +135,26 @@ Added to `projects` table. Populated by `emit_stage_complete()` after every stag
 - `backend/workers/pipeline/room_layout.py` — gravity-aware floor plane projection + void fill (called by fill_planes task)
 - `backend/workers/pipeline/refine_cloud.py` — SOR outlier removal + voxel downsampling
 - `backend/workers/pipeline/lingbot_fusion.py` — optional densification stage: per-frame affine depth calibration + TSDF fusion (runs in main env; calls the inference subprocess)
+- `backend/workers/pipeline/hvac_common.py` — HVAC helpers: frame download, cloud→frame projection, `wall_basis`, `quad_is_clean`, lazy GDINO / SAM2 / SegFormer loaders
+- `backend/workers/pipeline/wall_plane_detection.py`, `detect_hvac_fixtures.py`, `locate_rucklauf.py`, `hvac_placement.py` — the four HVAC stages
+- `frontend/components/HvacSegmentationViewer.tsx` — "Segmentation" tab; `frontend/components/lib/hvacOverlay.ts` — 3D placement overlay for the Point Cloud / Mesh tabs
+- `backend/workers/pipeline/metricanything_fusion.py` — optional densifier: MetricAnything metric depth per frame (calibrated f_px = COLMAP fx), per-frame affine calibration against `mvs/dense.ply`, TSDF fusion, void-gated merge
+- `backend/workers/pipeline/depth_fusion_common.py` — shared by both densifiers: `robust_affine`, `load_registered_cameras` (cameras.json → K, world→cam R/t in SfM units)
 - `backend/workers/pipeline/lingbot/infer_depth.py` — LingBot depth inference, runs in the isolated `/opt/lingbot-venv` (torch 2.8); **never imported by the worker**, file-path subprocess only
-- `backend/workers/pipeline/aruco_detector.py` — ArUco detection + baseline measurement
+- `backend/workers/pipeline/aruco_detector.py` — ArUco detection + baseline measurement (dispatches to grid detector when `marker_type="grid"`)
+- `backend/workers/pipeline/grid_marker_detector.py` — 3×3 grid marker detection (OpenCV + numpy): blobs → grid fit → darkness check → px/cm
+- `backend/workers/pipeline/grid_marker_scale.py` — post-SfM grid triangulation + Umeyama scale fit
 - `backend/workers/pipeline/matcher.py` — LightGlue feature matching
 - `backend/workers/pipeline/sfm.py` — pycolmap SfM with focal prior injection
 - `backend/workers/pipeline/mvs.py` — COLMAP dense reconstruction
 - `backend/workers/pipeline/scale_from_aruco.py` — post-SfM triangulation + scale derivation
 - `backend/workers/pipeline/coverage.py` — coverage scoring + shot suggestions
-- `backend/workers/pipeline/exporter.py` — PLY/OBJ/LAS export
+- `backend/workers/pipeline/exporter.py` — PLY/OBJ/LAS export + L×B×H dimensions
+- `backend/workers/pipeline/lidar_ingest.py` — LiDAR `.ply` ingest: scale + RANSAC gravity
+- `backend/workers/pipeline/dimensions.py` — floor/gravity detection, L×B×H from a gravity-aligned metric cloud, ground-truth comparison
+- `backend/core/storage.py` — storage abstraction (`STORAGE_BACKEND=local` only; files under `LOCAL_STORAGE_ROOT`)
 - `ml/metadata/extractor.py` — `extract_video_metadata()`: ffprobe + exiftool → focal length, rotation, GPS
-- `alembic/versions/` — DB migrations (010 is current head)
+- `alembic/versions/` — DB migrations (016 is current head)
 - `frontend/components/ResultsViewer.tsx` — tabbed Reconstruction view (Point Cloud, Mesh, Scene Overview, Walkthrough, RGB Cloud, Re-shoot)
 - `frontend/components/CameraWalkthroughViewer.tsx` — "Walkthrough" tab: step through real SfM camera poses, rotate-in-place free-look (FOV matched to lens), cloud/mesh toggle, photo-overlay compare, fullscreen
 - `frontend/components/CameraPathViewer.tsx` — "Scene Overview" tab: top-down camera trajectory + re-shoot/gap markers
@@ -173,6 +212,9 @@ The `/reprocess` endpoint reads from the checkpoint (detect_aruco_sfm output). T
 
 **LingBot fusion runs in an ISOLATED venv — never import `lingbot` in the worker.**
 The main worker env is torch 2.4.1/cu124 (pycolmap, LightGlue, gaussian-splatting CUDA ext, MASt3R all built against it). LingBot-Map needs torch 2.8/cu128, installed separately in `/opt/lingbot-venv` with the repo at `/opt/lingbot-map` (pinned commit). The stage (`lingbot_fusion.py`) does only numpy/open3d/scipy and shells out to `/opt/lingbot-venv/bin/python .../infer_depth.py` for depth inference — importing the `lingbot` package in the worker would clash torch ABIs. The fusion stage is **non-fatal**: on error it logs and returns `prev_result` so the pipeline still completes. The ~4.6 GB checkpoint lazy-downloads to `/app/models/lingbot/` on first run. Default off — set `ENABLE_LINGBOT_FUSION=1` to enable. Memory knobs match the 12 GB-GPU defaults proven earlier (windowed mode >120 frames, `num_scale_frames=2`, `camera_num_iterations=1`).
+
+**MetricAnything is vendored into the worker image at `/opt/metric-anything`.**
+`docker/Dockerfile.worker-gpu` clones github.com/metric-anything/metric-anything at a pinned commit outside `/app/backend` (the `./backend` bind mount would hide it there); `METRICANYTHING_VENDOR_DIR` points at it. The checkpoint (`yjh001/metricanything_student_depthmap`) lazy-downloads to `/app/models/metricanything` on first run. Unlike LingBot it runs in the worker process — keep the worker on torch <2.5 or move it to a venv+subprocess like LingBot. Fusion runs in SfM units against the **raw** `mvs/dense.ply` (poses and reference cloud must share units) and scales by `confirmed_scale_factor` at the end. Frames with <50 projected COLMAP points, <40 % inliers, or depth uncorrelated with COLMAP (r < 0.5) are skipped; zero calibrated frames raises → caught as non-fatal. Not available for LiDAR scans (no frames/poses). `scale_std` in the stage metrics shows per-frame scale drift.
 
 ## Running the smoke harness
 
@@ -232,9 +274,19 @@ WebSocket progress events are published to `project:{project_id}:progress` on Re
 | `ARUCO_DICT` | `DICT_4X4_100` | ArUco dictionary — must match printed markers |
 | `ARUCO_MIN_FRAMES` | `2` | Minimum frames a marker must appear in to be trusted |
 | `ARUCO_FLOOR_MARKER_ID` | lowest ID | Which marker is on the floor (for gravity alignment) |
+| `GRID_MARKER_SQUARE_CM` / `GRID_MARKER_PITCH_U_CM` / `GRID_MARKER_PITCH_V_CM` | `3.9` / `12.35` / `8.15` | Grid marker geometry (cm) — change only these for a differently sized print |
 | `GSPLAT_ITERATIONS` | `15000` | 3DGS training iterations (used in object chain after MVS) |
 | `ENABLE_LINGBOT_FUSION` | `false` | Enable the optional LingBot depth-fusion densification stage |
 | `LINGBOT_CHECKPOINT` | `/app/models/lingbot/lingbot-map.pt` | Checkpoint path (lazy-downloaded on first run) |
 | `LINGBOT_WINDOWED_THRESHOLD` | `120` | Frame count above which depth inference uses windowed mode |
 | `LINGBOT_MAX_FRAMES` | `300` | Cap on frames fed to depth inference; long walkthroughs (1000+) OOM even windowed, so evenly subsample above this |
+| `ENABLE_METRICANYTHING_FUSION` | `false` | Master switch for the optional MetricAnything densifier (also needs per-project opt-in) |
+| `METRICANYTHING_MAX_FRAMES` | `200` | Evenly subsample above this many frames (one forward pass per frame) |
+| `METRICANYTHING_VENDOR_DIR` | `/opt/metric-anything` | Vendored repo location (set by the worker image) |
+| `ENABLE_HVAC_PLACEMENT` | `false` | Master switch for the HVAC stages (also needs per-project `hvac_mode`; indoor only) |
+| `HVAC_UNIT_SIZE_CM` | `60x40` | Mounting rectangle searched for, W×H |
+| `HVAC_MIN_CLEARANCE_CM` | `45` | Minimum gap to any fixture keep-out |
+| `HVAC_MIN_WALL_INLIERS` / `HVAC_MIN_ADE20K_CONFIDENCE` | `2000` / `0.15` | Wall evidence floor / ADE20K wall-pixel exclusion |
+| `HVAC_ENABLE_SAM2` | `true` | SAM2 mask refinement (falls back to GDINO boxes if off or it fails to load) |
+| `HVAC_MAX_DETECTION_FRAMES` / `HVAC_MAX_WALL_SEG_FRAMES` | `150` / `40` | Frame caps for GDINO and ADE20K passes |
 | `LINGBOT_CONF_PERCENTILE` | `40` | Drop this %% of lowest-confidence depth pixels before fusion |

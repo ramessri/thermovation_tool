@@ -79,5 +79,40 @@ class Settings(BaseSettings):
     # subsample above this. ~300 views is ample for densification on a 12 GB GPU.
     LINGBOT_MAX_FRAMES: int = 300
 
+    # MetricAnything depth fusion — a second, alternative optional densifier
+    # (a project may enable LingBot, MetricAnything, both, or neither; each
+    # writes its own artifact). Runs in the main worker env: its requirements
+    # pin torch<2.5.0, which the worker's torch 2.4.1 satisfies — no venv.
+    ENABLE_METRICANYTHING_FUSION: bool = False
+    METRICANYTHING_VENDOR_DIR: Path = Path("/opt/metric-anything")
+    METRICANYTHING_CHECKPOINT_REPO: str = "yjh001/metricanything_student_depthmap"
+    METRICANYTHING_CHECKPOINT_FILE: str = "student_depthmap.pt"
+    METRICANYTHING_CACHE_DIR: Path = Path("/app/models/metricanything")
+    # One forward pass per frame (no windowed mode) — cap and evenly subsample.
+    METRICANYTHING_MAX_FRAMES: int = 200
+
+    # HVAC wall-mount placement (indoor_room only) — recommends where to mount a
+    # unit, anchored on the Rücklauf (return pipe). Gated two-tier: this switch
+    # AND the per-project hvac_mode flag. GDINO + SegFormer run in the main
+    # worker env via transformers; SAM2 has its own kill switch with a
+    # box-centroid fallback.
+    ENABLE_HVAC_PLACEMENT: bool = False
+    HVAC_GDINO_MODEL_ID: str = "IDEA-Research/grounding-dino-base"
+    HVAC_ENABLE_SAM2: bool = True
+    HVAC_SAM2_MODEL_ID: str = "facebook/sam2.1-hiera-small"
+    HVAC_SEGFORMER_MODEL_ID: str = "nvidia/segformer-b2-finetuned-ade-512-512"
+    HVAC_MIN_WALL_INLIERS: int = 2000
+    HVAC_MIN_CLEARANCE_CM: float = 45.0
+    # A wall candidate whose best frame has less than this ADE20K wall-pixel
+    # fraction is excluded (a bed's mattress edge once passed the inlier floor
+    # and the 25° tilt gate at 3% wall pixels). None = never checked = allowed.
+    HVAC_MIN_ADE20K_CONFIDENCE: float = 0.15
+    HVAC_UNIT_SIZE_CM: str = "60x40"        # candidate mounting rectangle, W x H
+    # GDINO+SAM2 per-frame cost is high — cap and evenly subsample above this.
+    HVAC_MAX_DETECTION_FRAMES: int = 150
+    # Frames sampled for ADE20K wall segmentation (only points an image
+    # classified as "wall" reach the plane fit).
+    HVAC_MAX_WALL_SEG_FRAMES: int = 40
+
 
 settings = Settings()

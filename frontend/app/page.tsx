@@ -80,6 +80,9 @@ export default function ProjectsPage() {
   const [newDesc, setNewDesc]           = useState('');
   const [newSceneType, setNewSceneType] = useState<'indoor_room' | 'outdoor' | 'object'>('indoor_room');
   const [newLingbot, setNewLingbot]     = useState(false);
+  const [newMetricAnything, setNewMetricAnything] = useState(false);
+  const [newHvac, setNewHvac]           = useState(false);
+  const [newMarkerType, setNewMarkerType] = useState<'aruco' | 'grid'>('aruco');
   const [creating, setCreating]         = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [selected, setSelected] = useState<Set<string>>(new Set());
@@ -114,7 +117,7 @@ export default function ProjectsPage() {
     if (!newName.trim()) return;
     try {
       setCreating(true);
-      const project = await createProject({ name: newName, description: newDesc, scene_type: newSceneType, lingbot_enabled: newLingbot });
+      const project = await createProject({ name: newName, description: newDesc, scene_type: newSceneType, lingbot_enabled: newLingbot, metricanything_enabled: newMetricAnything, hvac_mode: newHvac, marker_type: newMarkerType });
       router.push(`/projects/${project.id}`);
     } catch { setError('Failed to create project'); }
     finally { setCreating(false); }
@@ -234,6 +237,30 @@ export default function ProjectsPage() {
               </div>
             </div>
             <div>
+              <label className="block text-sm font-medium text-slate-700 mb-2">Scale Marker</label>
+              <p className="text-xs text-slate-500 mb-2">
+                Which printed marker is placed in the scene for automatic metric scale.
+              </p>
+              <div className="flex gap-2">
+                {(['aruco', 'grid'] as const).map(mt => (
+                  <button key={mt} type="button"
+                    onClick={() => setNewMarkerType(mt)}
+                    className={`rounded-lg border px-3 py-2 text-sm font-medium transition-colors ${
+                      newMarkerType === mt
+                        ? 'border-brand-500 bg-brand-50 text-brand-700'
+                        : 'border-slate-300 bg-white text-slate-600 hover:bg-slate-50'
+                    }`}>
+                    {mt === 'aruco' ? 'ArUco markers' : '3×3 grid marker'}
+                  </button>
+                ))}
+              </div>
+              <p className="text-xs text-slate-500 mt-2">
+                {newMarkerType === 'aruco'
+                  ? 'DICT_4X4_100 markers — 2+ visible together for best accuracy.'
+                  : '28.6 × 20.2 cm sheet with 9 black squares — keep it flat and visible from several viewpoints.'}
+              </p>
+            </div>
+            <div>
               <label className="flex items-start gap-2 cursor-pointer">
                 <input type="checkbox" checked={newLingbot}
                   onChange={e => setNewLingbot(e.target.checked)}
@@ -247,6 +274,36 @@ export default function ProjectsPage() {
                 </span>
               </label>
             </div>
+            <div>
+              <label className="flex items-start gap-2 cursor-pointer">
+                <input type="checkbox" checked={newMetricAnything}
+                  onChange={e => setNewMetricAnything(e.target.checked)}
+                  className="mt-0.5 h-4 w-4 rounded border-slate-300 text-brand-600 focus:ring-brand-500" />
+                <span className="text-sm text-slate-700">
+                  <span className="font-medium">🧠 Densify with MetricAnything depth fusion</span>
+                  <span className="block text-xs text-slate-500">
+                    Monocular metric-depth pass calibrated against the dense cloud to fill gaps.
+                    Video/photo scans only — no effect on LiDAR uploads.
+                  </span>
+                </span>
+              </label>
+            </div>
+            {newSceneType === 'indoor_room' && (
+              <div>
+                <label className="flex items-start gap-2 cursor-pointer">
+                  <input type="checkbox" checked={newHvac}
+                    onChange={e => setNewHvac(e.target.checked)}
+                    className="mt-0.5 h-4 w-4 rounded border-slate-300 text-brand-600 focus:ring-brand-500" />
+                  <span className="text-sm text-slate-700">
+                    <span className="font-medium">🌡️ HVAC wall-mount placement</span>
+                    <span className="block text-xs text-slate-500">
+                      Finds walls, pipes, outlets and windows, locates the Rücklauf (blue cap) and
+                      recommends where to mount a unit — shown on photos and in the 3D viewer.
+                    </span>
+                  </span>
+                </label>
+              </div>
+            )}
             <div className="flex gap-3 pt-2">
               <button type="submit" disabled={creating || !newName.trim()}
                 className="rounded-lg bg-brand-600 px-4 py-2 text-sm font-semibold text-white hover:bg-brand-700 disabled:opacity-50 transition-colors">

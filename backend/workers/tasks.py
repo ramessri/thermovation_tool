@@ -80,6 +80,11 @@ celery_app.conf.update(
         "pipeline.mvs":               {"queue": "gpu"},
         "pipeline.gaussian_splatting": {"queue": "gpu"},
         "pipeline.lingbot_fusion":    {"queue": "gpu"},
+        "pipeline.metricanything_fusion": {"queue": "gpu"},
+        "pipeline.wall_plane_detection": {"queue": "gpu"},
+        "pipeline.detect_hvac_fixtures": {"queue": "gpu"},
+        "pipeline.locate_rucklauf":      {"queue": "gpu"},
+        "pipeline.hvac_placement":       {"queue": "gpu"},
     },
 )
 
@@ -334,6 +339,9 @@ def extract_metadata_task(self, project_id: str, storage_key: str,
         _scene_type_raw = _r.get(f"project:{project_id}:scene_type")
         if _scene_type_raw:
             result["scene_type"] = _scene_type_raw.decode() if isinstance(_scene_type_raw, bytes) else _scene_type_raw
+        _gt_raw = _r.get(f"project:{project_id}:ground_truth_dimensions")
+        if _gt_raw:
+            result["ground_truth_dimensions"] = _json.loads(_gt_raw)
         result["storage_key"]      = storage_key
         result["all_storage_keys"] = [storage_key] + list(extra_keys or [])
         return result
@@ -411,6 +419,11 @@ def extract_frames(self, prev_result: dict, project_id: str) -> dict:
             result["resize_preset"] = resize_preset
         if calibration:
             result["_calibration"] = calibration
+        # Carry everything else extract_metadata injected (scene_type,
+        # ground_truth_dimensions, exclude_marker_ids, …) — without this they
+        # were silently dropped here, e.g. object scans lost the all-pairs
+        # matching window and the export never saw the tape-measure values.
+        result.update({k: v for k, v in prev_result.items() if k not in result})
         return result
     except Exception as e:
         update_job_status(job_id, JobStatus.FAILED, error=str(e))
@@ -434,6 +447,21 @@ def detect_aruco_task(self, prev_result: dict, project_id: str) -> dict:
     """
     from backend.workers.pipeline.aruco_detector import run_aruco_detection
 
+    # Which fiducial this project uses — chosen in the UI at project creation.
+    # Downstream stages read it from aruco_result["marker_type"].
+    try:
+        import psycopg2
+        _conn = psycopg2.connect(settings.DATABASE_URL.replace("postgresql+asyncpg://", "postgres://"))
+        _cur = _conn.cursor()
+        _cur.execute("SELECT marker_type FROM projects WHERE id = %s", (project_id,))
+        _row = _cur.fetchone()
+        _cur.close()
+        _conn.close()
+        marker_type = (_row[0] if _row else None) or "aruco"
+    except Exception as _e:
+        logger.warning("[%s] detect_aruco: marker_type lookup failed (%s) — using aruco", project_id, _e)
+        marker_type = "aruco"
+
     frame_keys     = prev_result.get("frame_keys", [])
     video_metadata = prev_result.get("video_metadata") or {}
     job_id = self.request.id
@@ -441,12 +469,14 @@ def detect_aruco_task(self, prev_result: dict, project_id: str) -> dict:
     t0     = _time.time()
     hb     = start_heartbeat(project_id, "detect_aruco")
     try:
-        update_job_status(job_id, JobStatus.RUNNING, 0.0, "Scanning for ArUco markers…")
+        update_job_status(job_id, JobStatus.RUNNING, 0.0,
+                          "Scanning for grid marker…" if marker_type == "grid" else "Scanning for ArUco markers…")
 
         aruco_result = asyncio.run(
             run_aruco_detection(
                 project_id, frame_keys, video_metadata, tmp,
                 progress_cb=make_progress_cb(project_id, "detect_aruco", job_id),
+                marker_type=marker_type,
             )
         )
 
@@ -467,16 +497,20 @@ def detect_aruco_task(self, prev_result: dict, project_id: str) -> dict:
         except Exception as db_err:
             logger.warning("[%s] detect_aruco: DB persist failed: %s", project_id, db_err)
 
-        ids   = aruco_result.get("aruco_ids_found", [])
-        n_bas = len(aruco_result.get("aruco_baselines", []))
-        update_job_status(job_id, JobStatus.SUCCESS, 1.0,
-                          f"ArUco: {len(ids)} markers — IDs {ids}")
-        emit_stage_complete(project_id, "detect_aruco", t0,
-                            f"Found {len(ids)} marker(s) — IDs {ids}; "
-                            f"{n_bas} inter-marker baseline(s)",
-                            metrics={"n_markers": len(ids),
+        ids    = aruco_result.get("aruco_ids_found", [])
+        n_bas  = len(aruco_result.get("aruco_baselines", []))
+        n_grid = len(aruco_result.get("grid_markers", {}))
+        if marker_type == "grid":
+            summary = f"Grid marker found in {n_grid} frame(s)"
+        else:
+            summary = f"Found {len(ids)} marker(s) — IDs {ids}; {n_bas} inter-marker baseline(s)"
+        update_job_status(job_id, JobStatus.SUCCESS, 1.0, summary)
+        emit_stage_complete(project_id, "detect_aruco", t0, summary,
+                            metrics={"marker_type": marker_type,
+                                     "n_markers": len(ids),
                                      "marker_ids": ids,
-                                     "n_baselines": n_bas})
+                                     "n_baselines": n_bas,
+                                     "grid_marker_frames": n_grid})
 
         result = dict(prev_result)
         result["aruco_result"] = aruco_result
@@ -713,16 +747,22 @@ def detect_aruco_sfm_task(self, prev_result: dict, project_id: str) -> dict:
         sfm_result = result.get("aruco_result", {})
         n_frames   = len(sfm_result.get("aruco_markers_sfm", {}))
         n_ids      = len(sfm_result.get("aruco_ids_sfm", []))
-        if n_frames == 0:
-            logger.warning(
-                "[%s] detect_aruco_sfm: 0 registered frames with ArUco markers — "
-                "scale_from_aruco will fall back to pre-SfM solvePnP path (less accurate)",
-                project_id,
-            )
-        update_job_status(job_id, JobStatus.SUCCESS, 1.0,
-                          f"ArUco SfM: {n_frames} frames, {n_ids} markers")
-        emit_stage_complete(project_id, "detect_aruco_sfm", t0,
-                            f"{n_frames} registered frames with markers, {n_ids} IDs",
+        if sfm_result.get("marker_type") == "grid":
+            n_frames = len(sfm_result.get("grid_markers_sfm", {}))
+            summary  = f"Grid marker in {n_frames} registered frames"
+            if n_frames < 2:
+                logger.warning("[%s] detect_aruco_sfm: grid marker in %d registered frame(s) — "
+                               "scale needs 2+", project_id, n_frames)
+        else:
+            summary = f"{n_frames} registered frames with markers, {n_ids} IDs"
+            if n_frames == 0:
+                logger.warning(
+                    "[%s] detect_aruco_sfm: 0 registered frames with ArUco markers — "
+                    "scale_from_aruco will fall back to pre-SfM solvePnP path (less accurate)",
+                    project_id,
+                )
+        update_job_status(job_id, JobStatus.SUCCESS, 1.0, summary)
+        emit_stage_complete(project_id, "detect_aruco_sfm", t0, summary,
                             metrics={"sfm_frames_with_markers": n_frames, "sfm_marker_ids": n_ids})
         # Save reprocess checkpoint — lets the /reprocess API re-dispatch any
         # downstream stage without manual Redis archaeology.
@@ -773,7 +813,9 @@ def scale_from_aruco_task(self, prev_result: dict, project_id: str) -> dict:
             warnings.append(
                 f"Scale not derivable ({diag.get('error', 'unknown reason')}). "
                 "Cloud will be exported in SfM units. "
-                "Ensure 2+ ArUco markers are visible in the same frame."
+                + ("Ensure the grid marker is clearly visible from several viewpoints."
+                   if diag.get("scale_source") == "grid_marker"
+                   else "Ensure 2+ ArUco markers are visible in the same frame.")
             )
         update_job_status(job_id, JobStatus.SUCCESS, 1.0,
                           f"Scale: {scale:.6f} m/unit" if scale else "Scale not derived")
@@ -924,6 +966,95 @@ def fill_planes_task(self, prev_result: dict, project_id: str) -> dict:
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+# ── LiDAR ingestion (alternate chain head — replaces extract_metadata through
+#    apply_known_scale in one step for pre-built .ply point cloud uploads) ────
+
+@celery_app.task(bind=True, name="pipeline.ingest_lidar_ply")
+def ingest_lidar_ply_task(self, project_id: str, ply_key: str,
+                          scene_type: str = "indoor_room",
+                          lidar_scale_factor: float = 1.0,
+                          ground_truth_dimensions: dict | None = None) -> dict:
+    """
+    Ingest a pre-built LiDAR .ply point cloud: no SfM/MVS, no camera poses.
+    Scale is trusted from the scanner (or the caller-supplied factor); gravity
+    is found via RANSAC on the raw cloud instead of camera poses.
+    """
+    from backend.workers.pipeline.lidar_ingest import run_lidar_ingest
+
+    job_id = self.request.id
+    tmp    = job_tmp(job_id)
+    t0     = _time.time()
+    hb     = start_heartbeat(project_id, "ingest_lidar_ply")
+    try:
+        update_job_status(job_id, JobStatus.RUNNING, 0.0, "Ingesting LiDAR point cloud…")
+        result = asyncio.run(
+            run_lidar_ingest(
+                project_id, ply_key, tmp,
+                progress_cb=make_progress_cb(project_id, "ingest_lidar_ply", job_id),
+                scene_type=scene_type,
+                lidar_scale_factor=lidar_scale_factor,
+                ground_truth_dimensions=ground_truth_dimensions,
+            )
+        )
+        info = result.get("lidar_ingest", {})
+        # The video path persists scale/gravity in scale_from_aruco; LiDAR has
+        # no such stage, so persist here (the project page reads these columns).
+        try:
+            import psycopg2, json as _json
+            conn = psycopg2.connect(settings.DATABASE_URL.replace("postgresql+asyncpg://", "postgres://"))
+            cur = conn.cursor()
+            cur.execute(
+                "UPDATE projects SET confirmed_scale_factor=%s, confirmed_scale_source=%s, "
+                "gravity_up_world=%s WHERE id=%s",
+                (result.get("confirmed_scale_factor"), result.get("confirmed_scale_source"),
+                 _json.dumps(result["gravity_up_world"]) if result.get("gravity_up_world") else None,
+                 project_id),
+            )
+            conn.commit(); cur.close(); conn.close()
+        except Exception as db_err:
+            logger.warning("[%s] ingest_lidar_ply: DB persist failed: %s", project_id, db_err)
+        update_job_status(job_id, JobStatus.SUCCESS, 1.0,
+                          f"{info.get('n_points', 0):,} points ingested")
+        emit_stage_complete(project_id, "ingest_lidar_ply", t0,
+                            f"{info.get('n_points', 0):,} pts, "
+                            f"floor={'found' if info.get('has_floor') else 'not found'}",
+                            metrics=info)
+        return result
+    except Exception as e:
+        update_job_status(job_id, JobStatus.FAILED, error=str(e))
+        raise
+    finally:
+        hb.set()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def launch_lidar_pipeline(project_id: str, ply_storage_key: str,
+                          scene_type: str | None = None,
+                          lidar_scale_factor: float = 1.0,
+                          ground_truth_dimensions: dict | None = None):
+    """
+    Kick off the short LiDAR chain: ingest → refine → export.
+
+    No camera poses, so coverage scoring and the optional densifier don't
+    apply and are skipped regardless of per-project flags.
+    """
+    from celery import chain
+
+    pipeline = chain(
+        ingest_lidar_ply_task.s(project_id, ply_storage_key, scene_type or "indoor_room",
+                                lidar_scale_factor, ground_truth_dimensions),
+        refine_cloud_task.s(project_id),
+        export_outputs.s(project_id),
+    )
+    result = pipeline.apply_async()
+
+    import redis as _redis
+    _r = _redis.from_url(settings.REDIS_URL)
+    _r.set(f"project:{project_id}:active_task", result.id, ex=_TTL_WEEK)
+    _create_job_for_task(project_id, "ingest_lidar_ply", result.id)
+    return result
+
+
 # ── Stage 7c: Point Cloud Refinement ─────────────────────────────────────────
 
 @celery_app.task(bind=True, name="pipeline.refine_cloud")
@@ -1011,6 +1142,200 @@ def lingbot_fusion_task(self, prev_result: dict, project_id: str) -> dict:
     finally:
         hb.set()
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+@celery_app.task(bind=True, name="pipeline.metricanything_fusion")
+def metricanything_fusion_task(self, prev_result: dict, project_id: str) -> dict:
+    """
+    Optional densification with MetricAnything monocular metric depth: same
+    affine-calibrated TSDF fusion as LingBot, emitting its own SEPARATE cloud +
+    mesh. Additive — does not alter dense_cloud_key. Runs in the main worker
+    env (no venv/subprocess).
+    """
+    from backend.workers.pipeline.metricanything_fusion import run_metricanything_fusion
+
+    job_id = self.request.id
+    tmp    = job_tmp(job_id)
+    t0     = _time.time()
+    hb     = start_heartbeat(project_id, "metricanything_fusion")
+    try:
+        scale = prev_result.get("confirmed_scale_factor")
+        update_job_status(job_id, JobStatus.RUNNING, 0.0, "Densifying with MetricAnything depth fusion…")
+        result = asyncio.run(
+            run_metricanything_fusion(
+                project_id, prev_result, tmp,
+                scale_factor=scale,
+                scene_type=prev_result.get("scene_type"),
+                progress_cb=make_progress_cb(project_id, "metricanything_fusion", job_id),
+            )
+        )
+        m = result.get("metricanything_fusion", {})
+        update_job_status(job_id, JobStatus.SUCCESS, 1.0,
+                          f"{m.get('fused_point_count',0):,} pts, {m.get('frames_used',0)} frames")
+        emit_stage_complete(project_id, "metricanything_fusion", t0,
+                            f"densified: {m.get('fused_point_count',0):,} pts, "
+                            f"{m.get('fused_mesh_tris',0):,} tris",
+                            metrics=m)
+        return result
+    except Exception as e:
+        # Additive/optional stage: never fail the whole pipeline on densification error.
+        logger.exception("[%s] metricanything_fusion failed (non-fatal): %s", project_id, e)
+        update_job_status(job_id, JobStatus.FAILED, error=str(e))
+        emit_stage_complete(project_id, "metricanything_fusion", t0,
+                            f"densification skipped (error): {e}",
+                            warnings=[str(e)])
+        return prev_result
+    finally:
+        hb.set()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+@celery_app.task(bind=True, name="pipeline.wall_plane_detection")
+def wall_plane_detection_task(self, prev_result: dict, project_id: str) -> dict:
+    """HVAC 1: ADE20K wall segmentation drives a RANSAC wall-plane fit on the metric cloud."""
+    from backend.workers.pipeline.wall_plane_detection import run_wall_plane_detection
+
+    job_id = self.request.id
+    tmp    = job_tmp(job_id)
+    t0     = _time.time()
+    hb     = start_heartbeat(project_id, "wall_plane_detection")
+    try:
+        update_job_status(job_id, JobStatus.RUNNING, 0.0, "Detecting wall planes…")
+        result = asyncio.run(
+            run_wall_plane_detection(
+                project_id, prev_result, tmp,
+                progress_cb=make_progress_cb(project_id, "wall_plane_detection", job_id),
+            )
+        )
+        walls = result.get("wall_candidates", [])
+        n_ok = sum(bool(c.get("meets_min_inliers")) for c in walls)
+        summary = f"{len(walls)} wall candidate(s), {n_ok} above evidence floor"
+        metrics = {"n_candidates": len(walls), "n_usable": n_ok}
+        update_job_status(job_id, JobStatus.SUCCESS, 1.0, summary)
+        emit_stage_complete(project_id, "wall_plane_detection", t0, summary, metrics=metrics)
+        return result
+    except Exception as e:
+        # Optional stage: never fail the whole pipeline on an HVAC error.
+        logger.exception("[%s] wall_plane_detection failed (non-fatal): %s", project_id, e)
+        update_job_status(job_id, JobStatus.FAILED, error=str(e))
+        emit_stage_complete(project_id, "wall_plane_detection", t0,
+                            f"wall detection skipped (error): {e}", warnings=[str(e)])
+        return prev_result
+    finally:
+        hb.set()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+@celery_app.task(bind=True, name="pipeline.detect_hvac_fixtures")
+def detect_hvac_fixtures_task(self, prev_result: dict, project_id: str) -> dict:
+    """HVAC 2: GDINO(+SAM2) fixture/obstacle/window detection, lifted into the dense cloud."""
+    from backend.workers.pipeline.detect_hvac_fixtures import run_detect_hvac_fixtures
+
+    job_id = self.request.id
+    tmp    = job_tmp(job_id)
+    t0     = _time.time()
+    hb     = start_heartbeat(project_id, "detect_hvac_fixtures")
+    try:
+        update_job_status(job_id, JobStatus.RUNNING, 0.0, "Detecting HVAC fixtures…")
+        result = asyncio.run(
+            run_detect_hvac_fixtures(
+                project_id, prev_result, tmp,
+                progress_cb=make_progress_cb(project_id, "detect_hvac_fixtures", job_id),
+            )
+        )
+        fixtures = result.get("hvac_fixtures", {})
+        summary = f"{sum(len(v) for v in fixtures.values())} fixture instance(s) across {len(fixtures)} classes"
+        metrics = {k: len(v) for k, v in fixtures.items()}
+        update_job_status(job_id, JobStatus.SUCCESS, 1.0, summary)
+        emit_stage_complete(project_id, "detect_hvac_fixtures", t0, summary, metrics=metrics)
+        return result
+    except Exception as e:
+        # Optional stage: never fail the whole pipeline on an HVAC error.
+        logger.exception("[%s] detect_hvac_fixtures failed (non-fatal): %s", project_id, e)
+        update_job_status(job_id, JobStatus.FAILED, error=str(e))
+        emit_stage_complete(project_id, "detect_hvac_fixtures", t0,
+                            f"fixture detection skipped (error): {e}", warnings=[str(e)])
+        return prev_result
+    finally:
+        hb.set()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+@celery_app.task(bind=True, name="pipeline.locate_rucklauf")
+def locate_rucklauf_task(self, prev_result: dict, project_id: str) -> dict:
+    """HVAC 3: color-cue (blue/red cap) Rücklauf/Vorlauf localization, GDINO fallback."""
+    from backend.workers.pipeline.locate_rucklauf import run_locate_rucklauf
+
+    job_id = self.request.id
+    tmp    = job_tmp(job_id)
+    t0     = _time.time()
+    hb     = start_heartbeat(project_id, "locate_rucklauf")
+    try:
+        update_job_status(job_id, JobStatus.RUNNING, 0.0, "Locating Rücklauf/Vorlauf…")
+        result = asyncio.run(
+            run_locate_rucklauf(
+                project_id, prev_result, tmp,
+                progress_cb=make_progress_cb(project_id, "locate_rucklauf", job_id),
+            )
+        )
+        rk = result.get("rucklauf_position")
+        summary = f"Rücklauf: {'found (' + rk['method'] + ')' if rk else 'not found'}"
+        metrics = {"rucklauf_found": rk is not None,
+                   "vorlauf_found": result.get("vorlauf_position") is not None}
+        update_job_status(job_id, JobStatus.SUCCESS, 1.0, summary)
+        emit_stage_complete(project_id, "locate_rucklauf", t0, summary, metrics=metrics)
+        return result
+    except Exception as e:
+        # Optional stage: never fail the whole pipeline on an HVAC error.
+        logger.exception("[%s] locate_rucklauf failed (non-fatal): %s", project_id, e)
+        update_job_status(job_id, JobStatus.FAILED, error=str(e))
+        emit_stage_complete(project_id, "locate_rucklauf", t0,
+                            f"Rücklauf localization skipped (error): {e}", warnings=[str(e)])
+        return prev_result
+    finally:
+        hb.set()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+@celery_app.task(bind=True, name="pipeline.hvac_placement")
+def hvac_placement_task(self, prev_result: dict, project_id: str) -> dict:
+    """HVAC 4: grid-search a wall-mount spot, scored by distance to the Rücklauf."""
+    from backend.workers.pipeline.hvac_placement import run_hvac_placement
+
+    job_id = self.request.id
+    tmp    = job_tmp(job_id)
+    t0     = _time.time()
+    hb     = start_heartbeat(project_id, "hvac_placement")
+    try:
+        update_job_status(job_id, JobStatus.RUNNING, 0.0, "Searching for a wall-mount spot…")
+        result = asyncio.run(
+            run_hvac_placement(
+                project_id, prev_result, tmp,
+                progress_cb=make_progress_cb(project_id, "hvac_placement", job_id),
+            )
+        )
+        hp = result.get("hvac_placement", {})
+        summary = f"HVAC placement: {hp.get('status')}, {len(hp.get('candidates', []))} candidate(s)"
+        metrics = {"status": hp.get("status"), "n_candidates": len(hp.get("candidates", []))}
+        update_job_status(job_id, JobStatus.SUCCESS, 1.0, summary)
+        emit_stage_complete(project_id, "hvac_placement", t0, summary, metrics=metrics)
+        return result
+    except Exception as e:
+        # Optional stage: never fail the whole pipeline on an HVAC error.
+        logger.exception("[%s] hvac_placement failed (non-fatal): %s", project_id, e)
+        update_job_status(job_id, JobStatus.FAILED, error=str(e))
+        emit_stage_complete(project_id, "hvac_placement", t0,
+                            f"placement skipped (error): {e}", warnings=[str(e)])
+        return prev_result
+    finally:
+        hb.set()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _hvac_tasks(project_id: str) -> list:
+    """The four HVAC stages, in order (callers gate on flags + scene type)."""
+    return [wall_plane_detection_task.s(project_id), detect_hvac_fixtures_task.s(project_id),
+            locate_rucklauf_task.s(project_id), hvac_placement_task.s(project_id)]
 
 
 # ── Stage 8: Coverage Analysis ────────────────────────────────────────────────
@@ -1112,6 +1437,9 @@ def export_outputs(self, prev_result: dict, project_id: str) -> dict:
                 project_id, export_cloud_key, tmp,
                 progress_cb=lambda p, m: publish_progress(project_id, "export", p, m),
                 scene_type=scene_type,
+                gravity_up_world=prev_result.get("gravity_up_world"),
+                ground_truth_dimensions=prev_result.get("ground_truth_dimensions"),
+                cloud_is_metric=prev_result.get("confirmed_scale_factor") is not None,
             )
         )
         result.update({k: v for k, v in prev_result.items() if k not in result})
@@ -1140,23 +1468,50 @@ def export_outputs(self, prev_result: dict, project_id: str) -> dict:
             row = cur.fetchone()
             raw = row[0] if row else None
             runs = raw if isinstance(raw, list) else (_json.loads(raw) if raw else [])
-            runs.append({
-                "ts": run_ts,
-                "score": coverage_score,
-                "cloud_key": ts_key,
-                "n_suggestions": len(suggestions),
-            })
+            # run_ts is only set when the coverage stage ran — the LiDAR
+            # chain skips coverage (no camera frustums to score).
+            if run_ts is not None:
+                runs.append({
+                    "ts": run_ts,
+                    "score": coverage_score,
+                    "cloud_key": ts_key,
+                    "n_suggestions": len(suggestions),
+                })
             splat_key = result.get("splat_key")
             mesh_key  = result.get("mesh_key")
             lingbot_cloud_key = result.get("lingbot_cloud_key")
             lingbot_mesh_key  = result.get("lingbot_mesh_key")
+            metricanything_cloud_key = result.get("metricanything_cloud_key")
+            metricanything_mesh_key  = result.get("metricanything_mesh_key")
+            dimensions = result.get("dimensions")
+            hvac_placement = result.get("hvac_placement")
+            hvac_segmentation = None
+            if any(k in result for k in ("wall_candidates", "hvac_fixtures", "rucklauf_position", "vorlauf_position")):
+                hvac_segmentation = {
+                    "wall_candidates":   result.get("wall_candidates", []),
+                    "hvac_fixtures":     result.get("hvac_fixtures", {}),
+                    "rucklauf_position": result.get("rucklauf_position"),
+                    "vorlauf_position":  result.get("vorlauf_position"),
+                }
             cur.execute(
                 "UPDATE projects SET status=%s::projectstatus, coverage_score=%s, "
                 "suggestions=%s, coverage_runs=%s, splat_key=%s, mesh_key=%s, "
-                "lingbot_cloud_key=%s, lingbot_mesh_key=%s WHERE id=%s",
+                # Optional-stage artifacts keep their previous value when this run
+                # didn't produce them (e.g. /reprocess from coverage or export).
+                "lingbot_cloud_key=COALESCE(%s, lingbot_cloud_key), "
+                "lingbot_mesh_key=COALESCE(%s, lingbot_mesh_key), "
+                "metricanything_cloud_key=COALESCE(%s, metricanything_cloud_key), "
+                "metricanything_mesh_key=COALESCE(%s, metricanything_mesh_key), dimensions=%s, "
+                "hvac_placement=COALESCE(%s::json, hvac_placement), "
+                "hvac_segmentation=COALESCE(%s::json, hvac_segmentation) WHERE id=%s",
                 (final_status, coverage_score, _json.dumps(suggestions),
                  _json.dumps(runs), splat_key, mesh_key,
-                 lingbot_cloud_key, lingbot_mesh_key, project_id),
+                 lingbot_cloud_key, lingbot_mesh_key,
+                 metricanything_cloud_key, metricanything_mesh_key,
+                 _json.dumps(dimensions) if dimensions else None,
+                 _json.dumps(_json_safe(hvac_placement)) if hvac_placement else None,
+                 _json.dumps(_json_safe(hvac_segmentation)) if hvac_segmentation else None,
+                 project_id),
             )
             conn.commit()
             cur.close()
@@ -1167,7 +1522,9 @@ def export_outputs(self, prev_result: dict, project_id: str) -> dict:
         emit_stage_complete(project_id, "export", t0,
                             f"Exported {len(result.get('exports', []))} file(s)",
                             metrics={"n_exports": len(result.get("exports", [])),
-                                     "coverage_score": coverage_score})
+                                     "coverage_score": coverage_score,
+                                     "dimensions": result.get("dimensions"),
+                                     "hvac_placement": result.get("hvac_placement")})
         return result
     finally:
         hb.set()
@@ -1263,7 +1620,8 @@ def scout_calibrate_task(self, prev_result: dict, project_id: str) -> dict:
 
 def launch_pipeline(project_id: str, storage_key: str, extra_keys: list | None = None,
                      exclude_marker_ids: list | None = None, resize_preset: str | None = None,
-                     scene_type: str | None = None, lingbot_enabled: bool = False):
+                     scene_type: str | None = None, lingbot_enabled: bool = False,
+                     metricanything_enabled: bool = False, hvac_mode: bool = False):
     """
     Kick off the full pipeline as a single continuous Celery chain.
 
@@ -1332,6 +1690,11 @@ def launch_pipeline(project_id: str, storage_key: str, extra_keys: list | None =
         # as a fleet-wide master kill-switch.
         *([lingbot_fusion_task.s(project_id)]
           if (settings.ENABLE_LINGBOT_FUSION and lingbot_enabled) else []),
+        *([metricanything_fusion_task.s(project_id)]
+          if (settings.ENABLE_METRICANYTHING_FUSION and metricanything_enabled) else []),
+        # Optional HVAC wall-mount placement — indoor rooms only.
+        *(_hvac_tasks(project_id)
+          if (settings.ENABLE_HVAC_PLACEMENT and hvac_mode and not is_object and not is_outdoor) else []),
         analyze_coverage.s(project_id),
         export_outputs.s(project_id),
     ]
@@ -1360,18 +1723,21 @@ def launch_full_pipeline(project_id: str, storage_key: str, calibration: dict,
     from celery import chain
     import psycopg2 as _pg2
 
-    # Read per-project densify opt-in (scout→full path has no caller param).
-    lingbot_enabled = False
+    # Read per-project densify opt-ins (scout→full path has no caller param).
+    lingbot_enabled = metricanything_enabled = hvac_on = False
     # Mark project as starting full run
     try:
         conn = _pg2.connect(settings.DATABASE_URL.replace("postgresql+asyncpg://", "postgres://"))
         cur  = conn.cursor()
         try:
-            cur.execute("SELECT lingbot_enabled FROM projects WHERE id=%s", (project_id,))
+            cur.execute("SELECT lingbot_enabled, metricanything_enabled, hvac_mode, scene_type "
+                        "FROM projects WHERE id=%s", (project_id,))
             _row = cur.fetchone()
-            lingbot_enabled = bool(_row[0]) if _row else False
+            if _row:
+                lingbot_enabled, metricanything_enabled = bool(_row[0]), bool(_row[1])
+                hvac_on = bool(_row[2]) and (_row[3] or "indoor_room") == "indoor_room"
         except Exception:
-            lingbot_enabled = False
+            lingbot_enabled = metricanything_enabled = hvac_on = False
         cur.execute("UPDATE projects SET status=%s, pipeline_mode=%s WHERE id=%s",
                     ("processing", "full", project_id))
         conn.commit(); cur.close(); conn.close()
@@ -1393,6 +1759,9 @@ def launch_full_pipeline(project_id: str, storage_key: str, calibration: dict,
         refine_cloud_task.s(project_id),
         *([lingbot_fusion_task.s(project_id)]
           if (settings.ENABLE_LINGBOT_FUSION and lingbot_enabled) else []),
+        *([metricanything_fusion_task.s(project_id)]
+          if (settings.ENABLE_METRICANYTHING_FUSION and metricanything_enabled) else []),
+        *(_hvac_tasks(project_id) if (settings.ENABLE_HVAC_PLACEMENT and hvac_on) else []),
         analyze_coverage.s(project_id),
         export_outputs.s(project_id),
     ]

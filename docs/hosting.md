@@ -41,8 +41,8 @@ docker info | grep -i cdi
 ## 2 — Clone and configure
 
 ```bash
-git clone https://github.com/N0t4R0b0t/photogram
-cd photogram
+git clone https://github.com/ramessri/thermovation_tool
+cd thermovation_tool
 
 cp .env.example .env
 ```
@@ -66,6 +66,10 @@ docker compose -f docker-compose.prod.yml build
 # Start everything
 docker compose -f docker-compose.prod.yml up -d
 ```
+
+The worker-gpu image also clones MetricAnything to `/opt/metric-anything` (pinned commit). Model weights for the
+optional Thermovation stages (MetricAnything, Grounding DINO, SAM2, SegFormer) download on first use into the
+`/app/models` volume — the first run with those stages enabled needs internet access.
 
 Migrations run automatically on API startup. Watch logs to confirm:
 

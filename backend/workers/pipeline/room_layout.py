@@ -57,13 +57,20 @@ def _gravity_from_cameras(cameras_json: dict) -> np.ndarray:
     In OpenCV camera convention, the camera Y-axis points down.
     For a right-side-up camera, Y-camera in world coords ≈ gravity-down.
 
-    cameras_json["images"] contains per-image R (world-to-camera rotation).
-    The camera Y-axis in world coords = R^T @ [0, 1, 0] = R[:, 1] transposed.
+    sfm.py writes each image's world-to-camera pose as cam_from_world.matrix_3x4
+    ([R|t]); the camera Y-axis in world coords = R^T @ [0, 1, 0].
     """
     gravity_down = np.zeros(3)
     images = cameras_json.get("images", [])
     for img in images:
-        R = np.array(img.get("R", [[1,0,0],[0,1,0],[0,0,1]]))
+        cfw = img.get("cam_from_world")
+        mat = cfw.get("matrix_3x4") if isinstance(cfw, dict) else cfw
+        if mat is not None:
+            R = np.array(mat, dtype=float).reshape(3, 4)[:, :3]
+        elif "R" in img:
+            R = np.array(img["R"], dtype=float)
+        else:
+            continue
         cam_y_world = R.T @ np.array([0., 1., 0.])
         gravity_down += cam_y_world
     if np.linalg.norm(gravity_down) < 1e-6:

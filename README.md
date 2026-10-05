@@ -1,5 +1,11 @@
 # Photogram
 
+> **Thermovation AI tool** — a clone of Photogram, with Thermovation features built on top of it:
+> choice of scale marker (ArUco or a custom 3×3 grid sheet), LiDAR `.ply` ingestion, automatic room
+> dimensions (L × B × H) for every input, MetricAnything depth-fusion densification, and HVAC wall-mount
+> placement shown on photos and in the 3D viewer. See [What Thermovation adds](#what-thermovation-adds).
+> Everything below that section describes the Photogram base it was cloned from.
+
 A research testbed for exploring where vision-language models can add meaningful value inside an established computer vision pipeline. The domain is photogrammetry — a well-understood, well-tooled process for reconstructing 3D geometry from images — chosen precisely because the baseline is solid enough that any VLM contribution can be evaluated against a known-good result.
 
 The core question: **in a pipeline where the geometry is already handled by classical methods (feature matching, SfM, MVS), where does a VLM actually help — and where does it get in the way?**
@@ -17,6 +23,38 @@ The headline finding: **VLM output is too inconsistent to trust in an automated 
 The deeper finding was about problem framing. VLMs were applied to compensate for missing information (a length reference absent from the footage). That is an *information* problem, not a perception problem. The right fix was to put the reference in the scene before filming — printed ArUco markers — rather than infer it afterward. A consistent physical process turned out to be less frustrating, faster, and more accurate than any AI approach.
 
 The [development journey](docs/journey.md) documents each experiment in full: what was tried, what failed, and what was learned.
+
+---
+
+## What Thermovation adds
+
+| Feature | What it does | Where |
+|---------|--------------|-------|
+| **Scale marker choice** | Pick per project: printed ArUco markers, or the custom 3×3 grid sheet (28.6 × 20.2 cm, 9 black squares). Grid scale = similarity fit of the 9 triangulated square centres to the known layout | `grid_marker_detector.py`, `grid_marker_scale.py` |
+| **LiDAR upload** | Upload an already-built `.ply` (iPhone/iPad LiDAR, scanner). Short chain: ingest → refine → export; scale trusted from the scanner (optional factor, e.g. 0.001 for mm) | `lidar_ingest.py` |
+| **Room dimensions** | Length × breadth × height (+ footprint, volume) for ArUco, grid and LiDAR scans. Floor found from the cloud when no marker floor exists. Optional tape-measure ground truth → per-field error % | `dimensions.py`, `DimensionsCard.tsx` |
+| **MetricAnything densifier** | Optional. Monocular metric depth per frame, calibrated against the COLMAP cloud, TSDF-fused; fills gaps as a separate cloud/mesh | `metricanything_fusion.py` |
+| **HVAC placement** | Optional, indoor. ADE20K walls → GDINO(+SAM2) fixtures → Rücklauf/Vorlauf (blue/red cap) → ranked 60×40 cm mounting spots. Shown in a *Segmentation* tab (photos) and drawn in 3D on the Point Cloud / Mesh tabs | `wall_plane_detection.py`, `detect_hvac_fixtures.py`, `locate_rucklauf.py`, `hvac_placement.py`, `lib/hvacOverlay.ts` |
+
+Optional stages are gated twice: an environment master switch (`ENABLE_METRICANYTHING_FUSION`, `ENABLE_HVAC_PLACEMENT`) **and** a per-project checkbox at creation.
+
+Thermovation-only pipeline (in addition to the base chain below):
+
+```
+Video (ArUco or grid marker):
+  … → detect_aruco (ArUco or grid, per project) → … → refine_cloud
+    → [lingbot_fusion] → [metricanything_fusion]
+    → [wall_plane_detection → detect_hvac_fixtures → locate_rucklauf → hvac_placement]   (indoor)
+    → coverage → export (+ dimensions)
+
+LiDAR .ply:
+  ingest_lidar_ply → refine_cloud → export (+ dimensions)
+```
+
+Fixes made in this clone that the Photogram base does not have: frame extraction no longer drops
+`scene_type` / ground truth / excluded marker IDs; gravity is read from the real camera poses; opposite
+walls are no longer merged as duplicates; densifiers no longer default to the `object` clip; reprocess
+keeps earlier stage results and restores the scaled cloud; `backend/core/storage.py` is included.
 
 ---
 
@@ -48,6 +86,9 @@ Scout mode runs a trimmed version (no MVS) to calibrate parameters for the full 
 | Coverage heatmap | Per-point visibility score via open3d HPR + DBSCAN, scene-type-aware suggestions |
 | Re-shoot suggestions | 3D camera positions targeting under-covered areas, with quality vs angle diagnosis |
 | Camera walkthrough | Step through real SfM camera poses with free-look rotate-in-place; blend the original video frame over the point cloud or mesh for ground-truth alignment comparison ([demo ↓](#camera-walkthrough)) |
+| Room dimensions *(Thermovation)* | L × B × H, footprint, volume; optional ground-truth error check |
+| HVAC placement *(Thermovation)* | Ranked wall-mount spots with photo overlay + 3D overlay |
+| Densified cloud/mesh *(Thermovation)* | MetricAnything (and LingBot) depth fusion, separate artifacts |
 | Formats | PLY, OBJ, LAS |
 
 ---
@@ -79,8 +120,8 @@ The walkthrough tab lets you step through actual SfM camera positions and overla
 Requires a Linux host with an NVIDIA GPU (≥ 12 GB VRAM for object scans with Gaussian Splatting; 8 GB sufficient for indoor/outdoor only), Docker, and [NVIDIA CDI](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/cdi-support.html) support.
 
 ```bash
-git clone https://github.com/N0t4R0b0t/photogram
-cd photogram
+git clone https://github.com/ramessri/thermovation_tool
+cd thermovation_tool
 cp .env.example .env          # set SECRET_KEY at minimum
 docker compose -f docker-compose.prod.yml up -d
 ```
@@ -90,7 +131,9 @@ docker compose -f docker-compose.prod.yml up -d
 | App | http://localhost:3000 |
 | API + Swagger | http://localhost:8000/docs |
 
-**Before your first scan**, print ArUco markers and place them in the scene:
+Migrations (including the Thermovation ones, 013–016) run automatically when the prod API starts; with the dev `docker-compose.yml` run `docker compose exec api alembic upgrade head`.
+
+**Before your first scan**, print ArUco markers (or use the 3×3 grid sheet — choose the marker when creating the project) and place them in the scene. LiDAR uploads need no marker:
 ```bash
 docker compose -f docker-compose.prod.yml exec worker-gpu \
   python /app/scripts/generate_aruco_sheet.py
@@ -118,6 +161,7 @@ The `/reprocess` API endpoint lets you re-run any post-MVS stage from the checkp
 | [docs/architecture.md](docs/architecture.md) | System design, C4 diagrams, data model, infrastructure |
 | [docs/operations.md](docs/operations.md) | Pipeline theory — every stage explained, tunable parameters |
 | [docs/contributing.md](docs/contributing.md) | Dev setup, adding stages, migrations, PR workflow |
+| [CLAUDE.md](CLAUDE.md) | Up-to-date orientation incl. all Thermovation stages, env vars and quirks |
 
 ---
 
@@ -131,12 +175,14 @@ The `/reprocess` API endpoint lets you re-run any post-MVS stage from the checkp
 | Feature matching | LightGlue + DISK (GPU) |
 | SfM | pycolmap incremental mapping |
 | Dense recon | COLMAP CLI `patch_match_stereo` / `stereo_fusion` (CUDA) |
-| Scale | ArUco (DICT_4X4_100) + post-SfM triangulation |
+| Scale | ArUco (DICT_4X4_100) or 3×3 grid sheet + post-SfM triangulation; LiDAR native scale |
+| Densification *(opt.)* | MetricAnything, LingBot-Map + open3d TSDF |
+| HVAC *(opt.)* | SegFormer/ADE20K, Grounding DINO, SAM2 (transformers) |
 | Geometry | open3d, numpy |
 | Coverage | open3d HPR + DBSCAN |
 | Exports | laspy (LAS), open3d (PLY/OBJ) |
 | DB | PostgreSQL + SQLAlchemy async |
-| Storage | Local FS · WebDAV · MinIO S3 · Filestack CDN |
+| Storage | Local FS (`STORAGE_BACKEND=local`; other backends not implemented) |
 
 ---
 
