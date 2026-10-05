@@ -1,5 +1,7 @@
 # Photogram Documentation
 
+> **Thermovation AI tool** — this repository is a clone of Photogram with Thermovation features built on top (scale-marker choice incl. a 3×3 grid sheet, LiDAR `.ply` ingestion, room dimensions, MetricAnything densification, HVAC wall-mount placement). The Thermovation additions are summarised in the root [README](../README.md#what-thermovation-adds) and detailed in [operations.md § Thermovation stages](operations.md#thermovation-stages).
+
 A research testbed for exploring where VLMs add value in a classical photogrammetry pipeline. The geometry is classical throughout — LightGlue, pycolmap, COLMAP MVS, open3d. The interesting question is what AI can contribute on top of that, and where it gets in the way.
 
 ## Camera walkthrough demo

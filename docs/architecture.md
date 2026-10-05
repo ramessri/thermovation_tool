@@ -107,6 +107,26 @@ refine_cloud → coverage → export
 
 `correct_trajectory_jumps` and `fill_planes` are skipped. `gaussian_splatting` is inserted after MVS. Feature matching uses all-pairs window (≥999) instead of the default sliding window of 15. Coverage boundary uses the 3D convex hull of camera positions.
 
+### Thermovation additions
+
+Video chains (any scene type) — the marker detected in `detect_aruco` / `detect_aruco_sfm` is the project's
+`marker_type` (`aruco` or `grid`); `scale_from_aruco` derives scale from whichever it is. After `refine_cloud`:
+
+```
+refine_cloud → [lingbot_fusion] → [metricanything_fusion]
+  → [wall_plane_detection → detect_hvac_fixtures → locate_rucklauf → hvac_placement]   (indoor_room only)
+  → coverage → export   (export also computes L × B × H dimensions)
+```
+
+Bracketed stages run only when their env switch (`ENABLE_LINGBOT_FUSION`, `ENABLE_METRICANYTHING_FUSION`,
+`ENABLE_HVAC_PLACEMENT`) **and** the per-project flag are on. All three are non-fatal.
+
+LiDAR chain (`POST /launch?scan_source=lidar_ply`):
+
+```
+ingest_lidar_ply → refine_cloud → export
+```
+
 ### Scout + Full mode
 
 **Scout chain** (fast calibration, ~15 min):
@@ -131,8 +151,8 @@ scale_from_aruco → scout_calibrate
 | `GET` | `/api/projects/{id}/uploads` | List all uploads for a project |
 | `GET` | `/api/projects/{id}/jobs` | List all pipeline jobs with elapsed times |
 | `POST` | `/api/projects/{id}/uploads` | Upload a video or image file |
-| `POST` | `/api/projects/{id}/launch` | Launch pipeline (`?mode=standard\|scout&scene_type=indoor_room\|outdoor\|object`) |
-| `POST` | `/api/projects/{id}/reprocess` | Re-dispatch downstream stages from a checkpoint (`?from_stage=scale_from_aruco\|coverage\|export`) |
+| `POST` | `/api/projects/{id}/launch` | Launch pipeline (`?mode=standard\|scout`). Thermovation: `scan_source=video\|lidar_ply`, `lidar_scale_factor`, `ground_truth_length_m` / `_breadth_m` / `_height_m` |
+| `POST` | `/api/projects/{id}/reprocess` | Re-dispatch downstream stages from a checkpoint (`?from_stage=scale_from_aruco\|fill_planes\|refine_cloud\|lingbot_fusion\|metricanything_fusion\|wall_plane_detection\|coverage\|export`, optional ground-truth params) |
 | `POST` | `/api/projects/{id}/launch_supplemental` | Add footage to an existing reconstruction |
 | `POST` | `/api/projects/{id}/cancel` | Revoke running pipeline |
 | `GET` | `/files/{key}` | Serve storage files (video: H.264 transcoded via `/preview/video/{key}`) |
@@ -212,6 +232,11 @@ erDiagram
 | `coverage_score` | 0–1 fraction of points with score ≥ 0.4 |
 | `splat_key` | Storage path to the `.splat` file for the in-browser Gaussian Splat viewer |
 | `mesh_key` | Storage path to the GS-extracted mesh OBJ (separate from the Poisson/BPA mesh in `exports/`) |
+| `marker_type` *(Thermovation)* | `aruco` · `grid` — scale fiducial chosen at project creation |
+| `scan_source` *(Thermovation)* | `video` · `lidar_ply` — set at launch |
+| `dimensions` *(Thermovation)* | `{length_m, breadth_m, height_m, footprint_m2, volume_m3, ground_truth_check?}` from export |
+| `metricanything_enabled` / `_cloud_key` / `_mesh_key` *(Thermovation)* | Per-project opt-in + densified artifacts |
+| `hvac_mode` / `hvac_placement` / `hvac_segmentation` *(Thermovation)* | Per-project opt-in + ranked placements (with `corners_world_m`) + wall/fixture/Rücklauf detections |
 
 ---
 

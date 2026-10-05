@@ -311,6 +311,44 @@ After computing calibration, stores it in the DB (`projects.scout_calibration`),
 
 ---
 
+## Thermovation stages
+
+Added in this clone on top of the Photogram pipeline. `CLAUDE.md` carries the full parameter detail.
+
+### Grid marker (`marker_type = grid`)
+A printed 28.6 × 20.2 cm sheet with 9 black 3.9 cm squares (centres 12.35 cm × 8.15 cm apart), chosen instead of
+ArUco at project creation. `detect_aruco` / `detect_aruco_sfm` run `grid_marker_detector.detect_marker()`:
+square blobs (adaptive + global thresholds, plus a paper-first pass for dark/busy floors) → 3×3 grid fit with a
+homography check → darkness check. Fails fast if the sheet is seen in fewer than `ARUCO_MIN_FRAMES` frames.
+`scale_from_aruco` triangulates the 9 centres from the SfM cameras and fits a similarity transform to the known
+layout (`grid_marker_scale.py`). Keep the sheet flat and visible from several viewpoints.
+
+### `ingest_lidar_ply` (LiDAR uploads)
+Replaces everything up to `apply_known_scale` for a pre-built `.ply`. Scale is trusted from the scanner
+(`lidar_scale_factor` multiplies otherwise, e.g. 0.001 for mm). "Up" = the dominant plane orientation with the
+smallest cloud extent (a room is wider than tall). Then `refine_cloud → export`.
+
+### Dimensions (in `export`)
+Computed whenever the cloud is metric and the scene isn't `object`. Up comes from the ArUco floor marker or LiDAR
+ingest, else from the cloud's own floor (`dimensions.detect_floor_gravity`). H = 0.5–99.5 percentile vertical
+extent; L/B = minimum-area rectangle of the footprint. Optional tape-measure ground truth adds per-field error %.
+Film the ceiling — height is the observed extent.
+
+### `metricanything_fusion` (optional)
+Monocular metric depth per frame (COLMAP fx as `f_px`), per-frame affine calibration against `mvs/dense.ply`
+(frames with poor/uncorrelated fits skipped), TSDF fusion, DBSCAN floater removal, void-gated merge with the
+COLMAP cloud, scaled to metric. Writes `metricanything/fused.ply` + `fused_mesh.obj`; does not change
+`dense_cloud_key`. Runs in the worker process (repo cloned into the image at `/opt/metric-anything`).
+
+### HVAC placement (optional, indoor)
+1. `wall_plane_detection` — ADE20K wall masks select cloud points; RANSAC walls (≤25° from vertical).
+2. `detect_hvac_fixtures` — Grounding DINO (+SAM2) pipes, valves, radiators, outlets, windows → 3D instances.
+3. `locate_rucklauf` — blue (Rücklauf) / red (Vorlauf) round caps by colour + shape, GDINO fallback.
+4. `hvac_placement` — grid search for a `HVAC_UNIT_SIZE_CM` spot clear of fixtures, ranked by distance to the
+   Rücklauf (or clearance), rendered on the best unoccluded photo; corners kept for the 3D viewer overlay.
+
+---
+
 ## Smoke testing individual stages
 
 ```bash
@@ -363,6 +401,9 @@ docker compose logs worker-gpu --follow --since 1h
 ---
 
 ## Tunable environment variables
+
+Thermovation variables (`ENABLE_METRICANYTHING_FUSION`, `METRICANYTHING_*`, `ENABLE_HVAC_PLACEMENT`, `HVAC_*`,
+`GRID_MARKER_*`) are listed in `CLAUDE.md` § Tunable environment variables.
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
