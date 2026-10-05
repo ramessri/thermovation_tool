@@ -7,6 +7,9 @@ this stage provides the metric data for scale_from_aruco.
 
 The result is stored as aruco_markers_sfm (indexed by image filename) and
 merged back into the existing aruco_result so scale_from_aruco sees it.
+
+For grid-marker projects (aruco_result["marker_type"] == "grid") the 3×3
+grid marker is re-detected instead (grid_markers_sfm, indexed by filename).
 """
 
 from __future__ import annotations
@@ -26,6 +29,7 @@ from backend.workers.pipeline.aruco_detector import (
     _build_camera_matrix,
     detect_markers_in_frame,
 )
+from backend.workers.pipeline.grid_marker_detector import detect_marker
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +46,7 @@ async def run_aruco_sfm(
     Returns prev_result updated with:
         aruco_markers_sfm   — dict[filename, list[detection]]  (always matches cameras.json)
         aruco_baselines_sfm — baselines recomputed from registered-frame detections
+        grid_markers_sfm    — dict[filename, grid detection] (grid-marker projects only)
     """
     storage = get_storage()
 
@@ -111,6 +116,8 @@ async def run_aruco_sfm(
 
     detections_by_name: dict[str, list[dict]] = {}
     n_detected = 0
+    scan_grid = aruco_result.get("marker_type") == "grid"
+    grid_by_name: dict[str, dict] = {}
 
     progress_cb(0.10, f"Scanning {n} registered frames for ArUco markers…")
 
@@ -131,12 +138,21 @@ async def run_aruco_sfm(
         if img is None:
             continue
 
-        dets = detect_markers_in_frame(img, camera_matrix, dist_coeffs, marker_size_m)
+        dets = [] if scan_grid else detect_markers_in_frame(img, camera_matrix, dist_coeffs, marker_size_m)
         # Keep all detected markers — don't filter by reliable_ids here so we
         # capture markers that may not have met the pre-SfM min-frames threshold
         if dets:
             detections_by_name[fname] = dets
             n_detected += len(dets)
+
+        if scan_grid:
+            try:
+                grid = detect_marker(img)
+            except Exception as e:
+                logger.debug("[%s] aruco_sfm: grid detection error on %s: %s", project_id, fname, e)
+                grid = None
+            if grid is not None:
+                grid_by_name[fname] = grid
 
         if i % 30 == 0 or i == n - 1:
             progress_cb(0.10 + 0.75 * (i + 1) / n,
@@ -173,6 +189,10 @@ async def run_aruco_sfm(
     updated_aruco["aruco_markers_sfm"]   = detections_by_name   # indexed by filename
     updated_aruco["aruco_baselines_sfm"] = baselines_sfm
     updated_aruco["aruco_ids_sfm"]       = ids_sfm
+    if scan_grid:
+        updated_aruco["grid_markers_sfm"] = grid_by_name
+        logger.info("[%s] aruco_sfm: grid marker in %d registered frames",
+                    project_id, len(grid_by_name))
 
     result = dict(prev_result)
     result["aruco_result"] = updated_aruco

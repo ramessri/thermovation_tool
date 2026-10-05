@@ -40,6 +40,9 @@ export const createProject = (data: {
   description?: string;
   scene_type?: "indoor_room" | "outdoor" | "object";
   lingbot_enabled?: boolean;
+  metricanything_enabled?: boolean;
+  hvac_mode?: boolean;
+  marker_type?: "aruco" | "grid";
 }) => api.post("/api/projects/", data).then((r) => r.data);
 
 export const listProjects = () =>
@@ -85,10 +88,21 @@ export const uploadCalibrationPhoto = (projectId: string, file: File) => {
     });
 };
 
-export const launchPipeline = (projectId: string, uploadId: string, mode: 'standard' | 'scout' = 'standard') =>
+export const launchPipeline = (
+  projectId: string,
+  uploadId: string,
+  mode: 'standard' | 'scout' = 'standard',
+  opts?: {
+    scan_source?: 'video' | 'lidar_ply';
+    lidar_scale_factor?: number;
+    ground_truth_length_m?: number;
+    ground_truth_breadth_m?: number;
+    ground_truth_height_m?: number;
+  },
+) =>
   api
     .post(`/api/projects/${projectId}/launch`, null, {
-      params: { upload_id: uploadId, mode },
+      params: { upload_id: uploadId, mode, ...opts },
     })
     .then((r) => r.data);
 

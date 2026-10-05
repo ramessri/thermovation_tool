@@ -1,5 +1,7 @@
 """Projects CRUD + video upload endpoints."""
 
+import logging
+
 from fastapi import APIRouter, UploadFile, File, HTTPException, Depends, Query
 from fastapi.responses import Response
 from pathlib import Path
@@ -14,6 +16,7 @@ from backend.core.storage import get_storage
 from backend.core.config import settings
 from backend.models.models import Project, Upload, Job, ProjectStatus, SceneType
 
+logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
@@ -22,6 +25,9 @@ class ProjectCreate(BaseModel):
     description: str = ""
     scene_type: str = "indoor_room"   # "indoor_room" | "outdoor" | "object"
     lingbot_enabled: bool = False     # opt-in to LingBot depth-fusion densification
+    metricanything_enabled: bool = False  # opt-in to MetricAnything depth-fusion densification
+    hvac_mode: bool = False           # opt-in to HVAC wall-mount placement (indoor_room only)
+    marker_type: str = "aruco"        # "aruco" | "grid" — scale fiducial used in the scan
 
 
 class ProjectUpdate(BaseModel):
@@ -57,6 +63,15 @@ class ProjectResponse(BaseModel):
     lingbot_cloud_key: str | None = None
     lingbot_mesh_key: str | None = None
     lingbot_enabled: bool = False
+    metricanything_cloud_key: str | None = None
+    metricanything_mesh_key: str | None = None
+    metricanything_enabled: bool = False
+    hvac_mode: bool = False
+    hvac_placement: dict | None = None
+    hvac_segmentation: dict | None = None
+    marker_type: str = "aruco"
+    scan_source: str = "video"
+    dimensions: dict | None = None
     aruco_markers: dict | None = None
     gravity_up_world: list | None = None
     calibration_data: dict | None = None
@@ -77,6 +92,8 @@ async def create_project(body: ProjectCreate, db: AsyncSession = Depends(get_db)
     except ValueError:
         raise HTTPException(400, f"Invalid scene_type '{body.scene_type}'. "
                                f"Valid values: indoor_room, outdoor, object")
+    if body.marker_type not in ("aruco", "grid"):
+        raise HTTPException(400, f"Invalid marker_type '{body.marker_type}'. Valid values: aruco, grid")
 
     project = Project(
         name=body.name,
@@ -84,6 +101,9 @@ async def create_project(body: ProjectCreate, db: AsyncSession = Depends(get_db)
         scene_type=st,
         status=ProjectStatus.CREATED,
         lingbot_enabled=body.lingbot_enabled,
+        metricanything_enabled=body.metricanything_enabled,
+        hvac_mode=body.hvac_mode,
+        marker_type=body.marker_type,
     )
     db.add(project)
     await db.commit()
@@ -222,6 +242,11 @@ async def launch_pipeline(
     mode: str = "standard",   # "standard" | "scout"
     exclude_marker_ids: str = "",   # comma-separated ArUco IDs to ignore in scale derivation
     resize_preset: str = "native",  # "native" | "2k" | "4k" | "8k"
+    scan_source: str = "video",     # "video" | "lidar_ply"
+    lidar_scale_factor: float = 1.0,  # applied only when scan_source="lidar_ply"
+    ground_truth_length_m: Optional[float] = None,
+    ground_truth_breadth_m: Optional[float] = None,
+    ground_truth_height_m: Optional[float] = None,
     db: AsyncSession = Depends(get_db),
 ):
     """Kick off the reconstruction pipeline.
@@ -235,7 +260,24 @@ async def launch_pipeline(
                     before SfM/MVS ("native" = no resize, "2k", "4k", "8k").
                     Lower presets run faster but reduce ArUco detection range
                     and dense-cloud detail.
+    scan_source — "video" (default) runs the full SfM/MVS chain. "lidar_ply"
+                  treats `upload_id` as a pre-built .ply point cloud and runs
+                  ingest → refine → export; mode/resize_preset/
+                  exclude_marker_ids are ignored.
+    lidar_scale_factor — multiply the cloud by this before treating it as
+                         metric (e.g. 0.001 for a scanner exporting mm).
+    ground_truth_length_m / _breadth_m / _height_m — optional tape-measure
+        reference; export reports predicted-vs-truth error % for each given.
     """
+    ground_truth_dimensions = {
+        k: v for k, v in (("length_m", ground_truth_length_m),
+                          ("breadth_m", ground_truth_breadth_m),
+                          ("height_m", ground_truth_height_m)) if v is not None
+    }
+
+    if scan_source not in ("video", "lidar_ply"):
+        raise HTTPException(400, "scan_source must be one of: video, lidar_ply")
+
     result = await db.execute(select(Project).where(Project.id == project_id))
     project = result.scalar_one_or_none()
     if not project:
@@ -245,6 +287,28 @@ async def launch_pipeline(
     upload = upload_result.scalar_one_or_none()
     if not upload:
         raise HTTPException(404, "Upload not found")
+
+    if scan_source == "lidar_ply":
+        from backend.workers.tasks import launch_lidar_pipeline as _launch_lidar
+        try:
+            scene_type = project.scene_type.value if project.scene_type else "indoor_room"
+            task = _launch_lidar(project_id, upload.storage_key, scene_type=scene_type,
+                                 lidar_scale_factor=lidar_scale_factor,
+                                 ground_truth_dimensions=ground_truth_dimensions or None)
+            if not task or not task.id:
+                raise HTTPException(500, "Failed to start pipeline")
+
+            project.status = ProjectStatus.PROCESSING
+            project.pipeline_mode = "standard"
+            project.scan_source = "lidar_ply"
+            await db.commit()
+
+            return {"task_id": task.id, "status": "launched", "mode": "standard", "scan_source": "lidar_ply"}
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.warning("launch_lidar_pipeline error: %s", e)
+            raise HTTPException(500, f"Failed to launch LiDAR pipeline: {str(e)}")
 
     # Collect all other uploads so all media is processed in extract_frames
     all_uploads_result = await db.execute(
@@ -266,6 +330,15 @@ async def launch_pipeline(
     if resize_preset not in ("native", "2k", "4k", "8k"):
         raise HTTPException(400, "resize_preset must be one of: native, 2k, 4k, 8k")
 
+    # Video chain picks ground truth up from Redis in extract_metadata
+    import redis as _redis, json as _json
+    _r = _redis.from_url(settings.REDIS_URL)
+    if ground_truth_dimensions:
+        _r.set(f"project:{project_id}:ground_truth_dimensions",
+               _json.dumps(ground_truth_dimensions), ex=86400)
+    else:
+        _r.delete(f"project:{project_id}:ground_truth_dimensions")
+
     try:
         scene_type = project.scene_type.value if project.scene_type else "indoor_room"
         if mode == "scout":
@@ -273,13 +346,16 @@ async def launch_pipeline(
         else:
             task = _launch_std(project_id, upload.storage_key, extra_keys=extra_keys,
                                 exclude_marker_ids=exclude_ids, resize_preset=resize_preset,
-                                scene_type=scene_type, lingbot_enabled=bool(project.lingbot_enabled))
+                                scene_type=scene_type, lingbot_enabled=bool(project.lingbot_enabled),
+                                metricanything_enabled=bool(project.metricanything_enabled),
+                                hvac_mode=bool(project.hvac_mode))
 
         if not task or not task.id:
             raise HTTPException(500, "Failed to start pipeline")
 
         project.status = ProjectStatus.PROCESSING
         project.pipeline_mode = mode
+        project.scan_source = "video"
         await db.commit()
 
         return {"task_id": task.id, "status": "launched", "mode": mode}
@@ -537,18 +613,25 @@ async def delete_failed_projects(db: AsyncSession = Depends(get_db)):
 
 # ── Reprocess from checkpoint ─────────────────────────────────────────────────
 
+_HVAC_STAGES = ["wall_plane_detection", "detect_hvac_fixtures", "locate_rucklauf", "hvac_placement"]
+
 REPROCESS_CHAIN: dict[str, list[str]] = {
     "scale_from_aruco": [
         "scale_from_aruco", "apply_known_scale", "fill_planes",
-        "refine_cloud", "lingbot_fusion", "coverage", "export",
+        "refine_cloud", "lingbot_fusion", "metricanything_fusion", *_HVAC_STAGES, "coverage", "export",
     ],
-    "fill_planes": ["fill_planes", "refine_cloud", "lingbot_fusion", "coverage", "export"],
-    "refine_cloud": ["refine_cloud", "lingbot_fusion", "coverage", "export"],
-    "lingbot_fusion": ["lingbot_fusion", "coverage", "export"],
+    "fill_planes": ["fill_planes", "refine_cloud", "lingbot_fusion", "metricanything_fusion",
+                    *_HVAC_STAGES, "coverage", "export"],
+    "refine_cloud": ["refine_cloud", "lingbot_fusion", "metricanything_fusion", *_HVAC_STAGES,
+                     "coverage", "export"],
+    "lingbot_fusion": ["lingbot_fusion", "metricanything_fusion", *_HVAC_STAGES, "coverage", "export"],
+    "metricanything_fusion": ["metricanything_fusion", *_HVAC_STAGES, "coverage", "export"],
+    "wall_plane_detection": [*_HVAC_STAGES, "coverage", "export"],
     "coverage":     ["coverage", "export"],
     "export":       ["export"],
 }
-# Note: "lingbot_fusion" is filtered out at dispatch unless ENABLE_LINGBOT_FUSION.
+# Note: the densifier stages are filtered out at dispatch unless enabled for the
+# project (and their ENABLE_* env flag, the fleet-wide master switch).
 
 
 @router.post("/{project_id}/reprocess")
@@ -556,6 +639,9 @@ async def reprocess(
     project_id: str,
     from_stage: str = "scale_from_aruco",
     exclude_marker_ids: str = "",   # comma-separated IDs to exclude, e.g. "7,12"
+    ground_truth_length_m: Optional[float] = None,
+    ground_truth_breadth_m: Optional[float] = None,
+    ground_truth_height_m: Optional[float] = None,
     db: AsyncSession = Depends(get_db),
 ):
     """
@@ -575,7 +661,8 @@ async def reprocess(
     from backend.workers.tasks import (
         scale_from_aruco_task, apply_known_scale_task,
         fill_planes_task, refine_cloud_task, lingbot_fusion_task,
-        analyze_coverage, export_outputs,
+        metricanything_fusion_task, wall_plane_detection_task, detect_hvac_fixtures_task,
+        locate_rucklauf_task, hvac_placement_task, analyze_coverage, export_outputs,
         _create_job_for_task,
     )
 
@@ -597,12 +684,43 @@ async def reprocess(
 
     prev_result = _json.loads(raw)
 
-    # Clear stale keys that will be recomputed
-    stale = ["confirmed_scale_factor", "confirmed_scale_source", "gravity_up_world",
-             "scale_diagnostics", "fitted_planes", "scaled_cloud_key",
-             "layout_cloud_key", "dense_point_count", "refinement"]
-    for k in stale:
-        prev_result.pop(k, None)
+    if from_stage == "scale_from_aruco":
+        # Clear stale keys that will be recomputed
+        stale = ["confirmed_scale_factor", "confirmed_scale_source", "gravity_up_world",
+                 "scale_diagnostics", "fitted_planes", "scaled_cloud_key",
+                 "layout_cloud_key", "dense_point_count", "refinement"]
+        for k in stale:
+            prev_result.pop(k, None)
+    else:
+        # The checkpoint is written once, right after detect_aruco_sfm, so it
+        # predates scale_from_aruco. Backfill scale/gravity from the project
+        # row (scale_from_aruco persists them there) — without this, later
+        # stages run with no scale (wrong voxel size, no metric dimensions).
+        prev_result.setdefault("confirmed_scale_factor", project.confirmed_scale_factor)
+        prev_result.setdefault("confirmed_scale_source", project.confirmed_scale_source)
+        prev_result.setdefault("gravity_up_world", project.gravity_up_world)
+
+        # Same for the cloud: the checkpoint's dense_cloud_key is the raw MVS
+        # output. Point it at the artifact of the stage just BEFORE from_stage
+        # (never from_stage's own output, which may be a prior broken run's).
+        layout  = f"{project_id}/mvs/dense_layout.ply"
+        refined = f"{project_id}/mvs/dense_refined.ply"
+        scaled  = f"{project_id}/clouds/scaled.ply"
+        upstream_candidates = {
+            "fill_planes":    [scaled],
+            "refine_cloud":   [layout, scaled],
+            "lingbot_fusion": [refined, layout, scaled],
+            "metricanything_fusion": [refined, layout, scaled],
+            "wall_plane_detection":  [refined, layout, scaled],
+            "coverage":       [refined, layout, scaled],
+            "export":         [refined, layout, scaled],
+        }
+        storage = get_storage()
+        for candidate_key in upstream_candidates.get(from_stage, []):
+            if storage.exists(candidate_key):
+                prev_result["dense_cloud_key"] = candidate_key
+                prev_result["scaled_cloud_key"] = candidate_key
+                break
 
     # Inject excluded marker IDs so scale_from_aruco_task can read them
     if exclude_marker_ids.strip():
@@ -614,6 +732,18 @@ async def reprocess(
     else:
         prev_result.pop("exclude_marker_ids", None)
 
+    # Ground truth for the export-stage error check — from_stage=export on a
+    # completed project is the cheapest way to test a tape-measure comparison.
+    ground_truth_dimensions = {
+        k: v for k, v in (("length_m", ground_truth_length_m),
+                          ("breadth_m", ground_truth_breadth_m),
+                          ("height_m", ground_truth_height_m)) if v is not None
+    }
+    if ground_truth_dimensions:
+        prev_result["ground_truth_dimensions"] = ground_truth_dimensions
+    else:
+        prev_result.pop("ground_truth_dimensions", None)
+
     # Build task list
     task_map = {
         "scale_from_aruco": scale_from_aruco_task,
@@ -621,13 +751,22 @@ async def reprocess(
         "fill_planes":       fill_planes_task,
         "refine_cloud":      refine_cloud_task,
         "lingbot_fusion":    lingbot_fusion_task,
+        "metricanything_fusion": metricanything_fusion_task,
+        "wall_plane_detection": wall_plane_detection_task,
+        "detect_hvac_fixtures": detect_hvac_fixtures_task,
+        "locate_rucklauf":   locate_rucklauf_task,
+        "hvac_placement":    hvac_placement_task,
         "coverage":          analyze_coverage,
         "export":            export_outputs,
     }
-    # lingbot_fusion only runs when enabled for this project (env flag = master kill-switch).
-    _lingbot_on = settings.ENABLE_LINGBOT_FUSION and bool(getattr(project, "lingbot_enabled", False))
-    stage_seq = [s for s in REPROCESS_CHAIN[from_stage]
-                 if s != "lingbot_fusion" or _lingbot_on]
+    # Densifiers only run when enabled for this project (env flag = master kill-switch).
+    _enabled = {
+        "lingbot_fusion": settings.ENABLE_LINGBOT_FUSION and bool(project.lingbot_enabled),
+        "metricanything_fusion": settings.ENABLE_METRICANYTHING_FUSION and bool(project.metricanything_enabled),
+        **dict.fromkeys(_HVAC_STAGES, settings.ENABLE_HVAC_PLACEMENT and bool(project.hvac_mode)
+                        and (project.scene_type is None or project.scene_type.value == "indoor_room")),
+    }
+    stage_seq = [s for s in REPROCESS_CHAIN[from_stage] if _enabled.get(s, True)]
     tasks = [task_map[s].s(project_id) for s in stage_seq]
 
     # Mark processing

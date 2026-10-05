@@ -63,6 +63,7 @@ class PipelineStage(str, PyEnum):
     COVERAGE          = "coverage"
     EXPORT            = "export"
     GAUSSIAN_SPLATTING = "gaussian_splatting"
+    INGEST_LIDAR_PLY  = "ingest_lidar_ply"  # chain head for scan_source="lidar_ply"
     # Legacy — preserved so existing job rows don't break ORM reads
     DEPTH_ESTIMATION  = "depth_estimation"
     SCALE_ANCHOR      = "scale_anchor"
@@ -113,7 +114,7 @@ class Project(Base):
     # ArUco scale (replaces anchor_candidates / VLM anchors)
     aruco_markers          = Column(JSON, nullable=True)    # detections by frame
     confirmed_scale_factor = Column(Float, nullable=True)
-    confirmed_scale_source = Column(String(256), nullable=True)  # "aruco" | "manual"
+    confirmed_scale_source = Column(String(256), nullable=True)  # "aruco" | "grid_marker" | "manual"
     gravity_up_world       = Column(JSON, nullable=True)          # [x,y,z] world-up vector
 
     # Outputs
@@ -122,6 +123,15 @@ class Project(Base):
     lingbot_cloud_key = Column(Text, nullable=True)  # LingBot-densified fused cloud (PLY)
     lingbot_mesh_key  = Column(Text, nullable=True)  # LingBot-densified fused mesh (OBJ)
     lingbot_enabled   = Column(Boolean, nullable=False, server_default="false")  # per-project densify opt-in
+    metricanything_cloud_key = Column(Text, nullable=True)   # MetricAnything-densified fused cloud (PLY)
+    metricanything_mesh_key  = Column(Text, nullable=True)   # MetricAnything-densified fused mesh (OBJ)
+    metricanything_enabled   = Column(Boolean, nullable=False, server_default="false")  # per-project opt-in
+
+    # HVAC wall-mount placement (indoor_room only)
+    hvac_mode         = Column(Boolean, nullable=False, server_default="false")  # per-project opt-in
+    hvac_placement    = Column(JSON, nullable=True)   # {status, candidates[{..., corners_world_m}], overlay_image_key}
+    hvac_segmentation = Column(JSON, nullable=True)   # {wall_candidates, hvac_fixtures, rucklauf_position, vorlauf_position}
+    marker_type       = Column(String(32), nullable=False, server_default="aruco")  # "aruco" | "grid"
 
     # Two-pass adaptive pipeline
     pipeline_mode    = Column(String(32), nullable=True)  # 'standard' | 'scout' | 'full'
@@ -129,6 +139,15 @@ class Project(Base):
 
     # Per-stage result summary written by emit_stage_complete — keyed by stage name
     pipeline_results = Column(JSON, nullable=True)
+
+    # 'video' (default, full SfM/MVS chain) or 'lidar_ply' (pre-built point
+    # cloud upload — ingest → refine → export, see launch_lidar_pipeline)
+    scan_source = Column(String(32), nullable=False, server_default='video')
+
+    # Real-world length x breadth x height from the gravity-aligned metric cloud
+    # at export time: {length_m, breadth_m, height_m, footprint_m2, volume_m3,
+    # n_points_used, ground_truth_check?}
+    dimensions = Column(JSON, nullable=True)
 
     # Legacy columns — preserved so old rows and old code don't crash
     anchor_reminder  = Column(Text, nullable=True)

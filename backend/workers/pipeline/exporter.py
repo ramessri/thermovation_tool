@@ -115,6 +115,9 @@ async def run_export(
     progress_cb: Callable[[float, str], None],
     object_labels: Optional[list[dict]] = None,
     scene_type: str = "indoor_room",
+    gravity_up_world: Optional[list[float]] = None,
+    ground_truth_dimensions: Optional[dict] = None,
+    cloud_is_metric: bool = False,
 ) -> dict:
     import open3d as o3d
 
@@ -132,6 +135,36 @@ async def run_export(
     progress_cb(0.05, f"Loaded point cloud: {n_pts:,} points")
 
     exports = []
+
+    # ── 1b. Real-world L x B x H ───────────────────────────────────────────────
+    # Only when the cloud is in metres (scale derived from markers, or LiDAR);
+    # an unscaled SfM cloud would report arbitrary units as metres. "Up" comes
+    # from the ArUco floor marker or LiDAR ingest when available, otherwise
+    # from the cloud's own floor plane. Object scans have no floor — skip.
+    dimensions = None
+    if cloud_is_metric and not is_object:
+        try:
+            from backend.workers.pipeline.dimensions import (
+                compare_to_ground_truth, compute_dimensions, detect_floor_gravity,
+            )
+            if not gravity_up_world:
+                progress_cb(0.055, "Detecting floor plane for dimensions…")
+                gravity_up_world, _ = detect_floor_gravity(pcd)
+            if gravity_up_world:
+                dimensions = compute_dimensions(pcd, gravity_up_world, scale=1.0)
+                progress_cb(0.06, f"Dimensions: {dimensions['length_m']}m x "
+                                  f"{dimensions['breadth_m']}m x {dimensions['height_m']}m")
+                if ground_truth_dimensions:
+                    gt_check = compare_to_ground_truth(dimensions, ground_truth_dimensions)
+                    if gt_check:
+                        dimensions["ground_truth_check"] = gt_check
+                        mae = gt_check.get("mean_abs_error_pct")
+                        if mae is not None:
+                            progress_cb(0.065, f"Ground-truth check: {mae:.1f}% mean abs error")
+            else:
+                logger.warning("[exporter] no floor plane found — dimensions unavailable")
+        except Exception as e:
+            logger.warning("[exporter] dimension computation failed: %s", e)
 
     # ── 2. PLY export ─────────────────────────────────────────────────────────
     # For object scans: export the scaled MVS cloud (real RGB, clean geometry).
@@ -608,4 +641,4 @@ async def run_export(
     })
     progress_cb(1.0, "All exports complete.")
 
-    return {"exports": exports}
+    return {"exports": exports, "dimensions": dimensions}

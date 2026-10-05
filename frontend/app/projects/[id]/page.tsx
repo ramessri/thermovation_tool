@@ -19,6 +19,8 @@ import { SuggestionsPanel } from '@/components/SuggestionsPanel';
 import { ActivityLog, WsEvent } from '@/components/ActivityLog';
 import { PipelineLog, StageDetail, buildStageDetails, buildStageDetailsFromMeta } from '@/components/PipelineLog';
 import { ShootingGuide } from '@/components/ShootingGuide';
+import { DimensionsCard, Dimensions } from '@/components/DimensionsCard';
+import type { HvacPlacementResult, HvacSegmentation } from '@/components/HvacSegmentationViewer';
 import { API_BASE } from '@/lib/api';
 
 interface ProjectDetail {
@@ -27,6 +29,7 @@ interface ProjectDetail {
   description: string;
   status: string;
   scene_type?: string;
+  marker_type?: string;
   confirmed_scale_factor?: number;
   confirmed_scale_source?: string;
   coverage_runs?: Array<{ ts: number; score: number; cloud_key: string; n_suggestions: number }> | null;
@@ -34,12 +37,19 @@ interface ProjectDetail {
   mesh_key?: string | null;
   lingbot_cloud_key?: string | null;
   lingbot_mesh_key?: string | null;
+  metricanything_cloud_key?: string | null;
+  metricanything_mesh_key?: string | null;
+  hvac_mode?: boolean;
+  hvac_placement?: HvacPlacementResult | null;
+  hvac_segmentation?: HvacSegmentation | null;
   suggestions?: any[] | null;
   gravity_up_world?: number[] | null;
   pipeline_mode?: string | null;
   scout_calibration?: Record<string, any> | null;
   created_at?: string | null;
   pipeline_results?: Record<string, any> | null;
+  scan_source?: 'video' | 'lidar_ply';
+  dimensions?: Dimensions | null;
 }
 
 interface ProgressUpdate {
@@ -71,6 +81,7 @@ const FAST_STALL_MS = 3 * 60 * 1000;
 
 // New linear pipeline — single phase, no user gate.
 const STAGES = [
+  { id: 'ingest_lidar_ply',  label: 'Ingesting LiDAR Cloud',    order: 0 },
   { id: 'extract_metadata',  label: 'Video Metadata',          order: 0 },
   { id: 'extract_frames',    label: 'Extracting Frames',        order: 1 },
   { id: 'detect_aruco',      label: 'ArUco Marker Detection',   order: 2 },
@@ -82,6 +93,12 @@ const STAGES = [
   { id: 'apply_scale',       label: 'Applying Scale',           order: 8 },
   { id: 'fill_planes',       label: 'Filling Surface Planes',   order: 9 },
   { id: 'refine_cloud',      label: 'Refining Point Cloud',     order: 10 },
+  { id: 'lingbot_fusion',    label: 'Densifying (LingBot)',     order: 10 },
+  { id: 'metricanything_fusion', label: 'Densifying (MetricAnything)', order: 10 },
+  { id: 'wall_plane_detection', label: 'Detecting Wall Planes',   order: 10 },
+  { id: 'detect_hvac_fixtures', label: 'Detecting HVAC Fixtures', order: 10 },
+  { id: 'locate_rucklauf',   label: 'Locating Rücklauf',          order: 10 },
+  { id: 'hvac_placement',    label: 'HVAC Placement',             order: 10 },
   { id: 'coverage',          label: 'Analyzing Coverage',       order: 10 },
   { id: 'export',            label: 'Exporting Results',        order: 11 },
   // Scout pipeline stages (only visible for scout runs)
@@ -182,6 +199,12 @@ export default function ProjectDetailPage() {
   const [jobResult, setJobResult]           = useState<Awaited<ReturnType<typeof getJobResult>>['result'] | null>(null);
   const [stageLog, setStageLog]             = useState<Map<string, StageDetail>>(new Map());
   const [pipelineMode, setPipelineMode]     = useState<'standard' | 'scout'>('standard');
+  const [scanSource, setScanSource]         = useState<'video' | 'lidar_ply'>('video');
+  const [lidarScaleFactor, setLidarScaleFactor] = useState(1.0);
+  const [showGroundTruth, setShowGroundTruth] = useState(false);
+  const [gtLength, setGtLength]             = useState('');
+  const [gtBreadth, setGtBreadth]           = useState('');
+  const [gtHeight, setGtHeight]             = useState('');
   const [calibFile, setCalibFile]           = useState<File | null>(null);
   const [calibUploading, setCalibUploading] = useState(false);
   const [calibResult, setCalibResult]       = useState<{ focal_length_px?: number; make?: string; model?: string } | null>(null);
@@ -529,7 +552,15 @@ export default function ProjectDetailPage() {
       }
       if (!primaryUploadId) primaryUploadId = uploadIds[0];
 
-      const launchResult = await launchPipeline(projectId, primaryUploadId, pipelineMode);
+      const launchOpts: NonNullable<Parameters<typeof launchPipeline>[3]> = {};
+      if (scanSource === 'lidar_ply') {
+        launchOpts.scan_source = 'lidar_ply';
+        launchOpts.lidar_scale_factor = lidarScaleFactor;
+      }
+      if (gtLength.trim())  launchOpts.ground_truth_length_m  = parseFloat(gtLength);
+      if (gtBreadth.trim()) launchOpts.ground_truth_breadth_m = parseFloat(gtBreadth);
+      if (gtHeight.trim())  launchOpts.ground_truth_height_m  = parseFloat(gtHeight);
+      const launchResult = await launchPipeline(projectId, primaryUploadId, pipelineMode, launchOpts);
       if (launchResult?.task_id) setTaskId(launchResult.task_id);
 
       if (wsDisconnect.current) wsDisconnect.current();
@@ -728,6 +759,12 @@ export default function ProjectDetailPage() {
               <span className="font-medium capitalize">{project.scene_type.replace(/_/g, ' ')}</span>
             </div>
           )}
+          {project.marker_type && (
+            <div className="flex items-center gap-1.5">
+              <span className="text-slate-400">Marker</span>
+              <span className="font-medium">{project.marker_type === 'grid' ? '3×3 grid' : 'ArUco'}</span>
+            </div>
+          )}
           {project.pipeline_mode && (
             <div className="flex items-center gap-1.5">
               <span className="text-slate-400">Mode</span>
@@ -860,8 +897,88 @@ export default function ProjectDetailPage() {
             </div>
           </div>
 
-          {/* Step 3 — Video upload */}
-          {/* Mode selector */}
+          {/* Scan source selector */}
+          <div className="mb-5">
+            <h3 className="text-sm font-semibold text-slate-800 mb-2">Scan source</h3>
+            <div className="flex gap-2">
+              {([
+                { id: 'video',     label: '🎥 Video / Photos', desc: 'Full SfM/MVS reconstruction from footage' },
+                { id: 'lidar_ply', label: '📡 LiDAR Point Cloud', desc: 'Upload an already-built .ply — skips straight to refine/export' },
+              ] as const).map(opt => (
+                <button
+                  key={opt.id}
+                  onClick={() => { setScanSource(opt.id); setPendingFiles([]); }}
+                  className={`flex-1 rounded-lg border px-3 py-2 text-left transition ${
+                    scanSource === opt.id
+                      ? 'border-brand-400 bg-brand-50 text-brand-800'
+                      : 'border-slate-200 bg-white text-slate-600 hover:bg-slate-50'
+                  }`}
+                >
+                  <div className="flex items-center gap-1.5 mb-0.5">
+                    <span className={`h-3 w-3 rounded-full border-2 ${scanSource === opt.id ? 'border-brand-500 bg-brand-500' : 'border-slate-300'}`} />
+                    <span className="text-sm font-medium">{opt.label}</span>
+                  </div>
+                  <p className="text-xs ml-4.5 text-slate-500 pl-5">{opt.desc}</p>
+                </button>
+              ))}
+            </div>
+            {scanSource === 'lidar_ply' && (
+              <div className="mt-3 ml-1 rounded-lg bg-amber-50 border border-amber-200 px-3 py-2 text-xs text-amber-800 space-y-2">
+                <p>
+                  No ArUco/grid markers needed — scale comes from the scanner. The floor is found
+                  from the cloud itself, then refinement and export run.
+                </p>
+                <label className="flex items-center gap-2">
+                  <span className="font-medium">Scale factor</span>
+                  <input
+                    type="number"
+                    step="any"
+                    min={0}
+                    value={lidarScaleFactor}
+                    onChange={e => setLidarScaleFactor(parseFloat(e.target.value) || 1.0)}
+                    className="w-24 rounded border border-amber-300 px-2 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-amber-400"
+                  />
+                  <span className="text-amber-700">Leave at 1.0 if your scanner already exports metres (e.g. mm → 0.001)</span>
+                </label>
+              </div>
+            )}
+          </div>
+
+          {/* Ground-truth dimensions (optional) — sanity-checks the derived scale */}
+          <div className="mb-5">
+            <button
+              type="button"
+              onClick={() => setShowGroundTruth(v => !v)}
+              className="text-sm font-semibold text-slate-800 hover:text-brand-700 transition-colors"
+            >
+              {showGroundTruth ? '▾' : '▸'} Ground truth dimensions <span className="font-normal text-slate-400">(optional)</span>
+            </button>
+            {showGroundTruth && (
+              <div className="mt-2">
+                <p className="text-xs text-slate-500 mb-2">
+                  Tape-measure the room yourself and enter what you get. The results will show
+                  predicted-vs-truth error % for each field you fill in. Leave any field blank to skip it.
+                </p>
+                <div className="flex gap-3">
+                  {([
+                    { label: 'Length (m)',  value: gtLength,  set: setGtLength,  ph: 'e.g. 4.20' },
+                    { label: 'Breadth (m)', value: gtBreadth, set: setGtBreadth, ph: 'e.g. 3.10' },
+                    { label: 'Height (m)',  value: gtHeight,  set: setGtHeight,  ph: 'e.g. 2.65' },
+                  ]).map(f => (
+                    <label key={f.label} className="flex-1 text-xs text-slate-600">
+                      {f.label}
+                      <input type="number" step="any" min={0} value={f.value}
+                        onChange={e => f.set(e.target.value)} placeholder={f.ph}
+                        className="mt-1 w-full rounded-lg border border-slate-300 px-2 py-1.5 text-sm focus:border-brand-500 focus:outline-none focus:ring-1 focus:ring-brand-500" />
+                    </label>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+
+          {/* Mode selector (video only) */}
+          {scanSource === 'video' && (
           <div className="mb-5">
             <h3 className="text-sm font-semibold text-slate-800 mb-2">Processing mode</h3>
             <div className="flex gap-2">
@@ -887,6 +1004,7 @@ export default function ProjectDetailPage() {
               ))}
             </div>
           </div>
+          )}
 
           <div>
             <div className="flex items-center gap-2 mb-3">
@@ -912,12 +1030,16 @@ export default function ProjectDetailPage() {
               >
                 <Upload className="mx-auto mb-2 h-8 w-8 text-slate-400" />
                 <p className="text-sm font-medium text-slate-700">Click or drag files here</p>
-                <p className="text-xs text-slate-400 mt-1">Videos (MP4, MOV) and photos (JPEG, PNG, HEIC) — add as many as you like</p>
+                <p className="text-xs text-slate-400 mt-1">
+                  {scanSource === 'lidar_ply'
+                    ? 'A single LiDAR point cloud (.ply)'
+                    : 'Videos (MP4, MOV) and photos (JPEG, PNG, HEIC) — add as many as you like'}
+                </p>
                 <input
                   ref={fileInputRef}
                   type="file"
-                  accept="video/*,image/*,.heic,.heif"
-                  multiple
+                  accept={scanSource === 'lidar_ply' ? '.ply' : 'video/*,image/*,.heic,.heif'}
+                  multiple={scanSource !== 'lidar_ply'}
                   onChange={handleFileSelect}
                   disabled={uploading}
                   className="hidden"
@@ -934,7 +1056,7 @@ export default function ProjectDetailPage() {
                       : `${(f.size / 1e6).toFixed(1)} MB`;
                     return (
                       <div key={i} className="flex items-center gap-2 rounded-lg bg-white border border-slate-200 px-3 py-2">
-                        <span className="text-base">{isVideo ? '🎬' : '📷'}</span>
+                        <span className="text-base">{/\.ply$/i.test(f.name) ? '📡' : isVideo ? '🎬' : '📷'}</span>
                         <span className="flex-1 text-xs text-slate-700 truncate">{f.name}</span>
                         <span className="text-xs text-slate-400 shrink-0">{sizeStr}</span>
                         <button
@@ -1329,6 +1451,13 @@ export default function ProjectDetailPage() {
                 />
               </div>
 
+              {/* Real-world dimensions */}
+              <div className="mb-6">
+                <DimensionsCard
+                  dimensions={project?.dimensions ?? project?.pipeline_results?.export?.dimensions}
+                />
+              </div>
+
               <ResultsViewer
                 projectId={projectId}
                 exports={jobResult?.exports}
@@ -1338,6 +1467,10 @@ export default function ProjectDetailPage() {
                 gsMeshKey={project?.mesh_key}
                 lingbotCloudKey={project?.lingbot_cloud_key}
                 lingbotMeshKey={project?.lingbot_mesh_key}
+                metricanythingCloudKey={project?.metricanything_cloud_key}
+                metricanythingMeshKey={project?.metricanything_mesh_key}
+                hvacPlacement={project?.hvac_placement ?? project?.pipeline_results?.export?.hvac_placement}
+                hvacSegmentation={project?.hvac_segmentation}
                 objectLabels={[]}
                 apiBase={API_BASE}
               />

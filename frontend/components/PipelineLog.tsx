@@ -228,6 +228,24 @@ export function buildStageDetailsFromMeta(
       'Coverage score': `${(v('coverage_score') * 100).toFixed(1)}%`,
       'Re-shoot areas': num('n_suggestions'),
     } : undefined;
+    case 'wall_plane_detection': return {
+      'Wall candidates': num('n_candidates'),
+      'Above evidence floor': num('n_usable'),
+    };
+    case 'detect_hvac_fixtures': {
+      const parts = ['pipes', 'valves', 'radiators', 'electrical', 'windows']
+        .map(k => (num(k) ? `${num(k)} ${k}` : undefined))
+        .filter(Boolean);
+      return { 'Fixtures found': parts.length > 0 ? parts.join(', ') : '0' };
+    }
+    case 'locate_rucklauf': return {
+      'Rücklauf': v('rucklauf_found') === true ? 'found' : v('rucklauf_found') === false ? 'not found' : undefined,
+      'Vorlauf': v('vorlauf_found') === true ? 'found' : v('vorlauf_found') === false ? 'not found' : undefined,
+    };
+    case 'hvac_placement': return {
+      'Status': v('status'),
+      'Candidates ranked': num('n_candidates'),
+    };
     case 'refine_cloud': return {
       'Noise removed': v('sor_removed') != null ? Number(v('sor_removed')).toLocaleString() : undefined,
       'Final points': v('n_after') != null ? Number(v('n_after')).toLocaleString() : undefined,
@@ -276,6 +294,13 @@ export function buildStageDetails(
     }
     case 'detect_aruco': {
       const ar = jobResult.aruco_result ?? {};
+      if (ar.marker_type === 'grid') {
+        return {
+          'Marker': '3×3 grid',
+          'Frames with marker': ar.grid_frames_found,
+          'Frames checked': ar.aruco_frames_checked,
+        };
+      }
       const ids: number[] = ar.aruco_ids_found ?? [];
       const baselines: any[] = ar.aruco_baselines ?? [];
       const scaleMethod = baselines.length > 0 ? 'triangulated baseline (accurate)' : 'solvePnP single marker (less accurate)';
@@ -339,6 +364,38 @@ export function buildStageDetails(
         'Factor used': jobResult.scale_factor != null
           ? `${Number(jobResult.scale_factor).toFixed(5)} m/unit` : undefined,
       } : undefined;
+    case 'wall_plane_detection': {
+      const candidates = jobResult.wall_candidates ?? [];
+      return candidates.length > 0 ? {
+        'Wall candidates': candidates.length,
+        'Above evidence floor': candidates.filter((c: any) => c.meets_min_inliers).length,
+        'Top candidate inliers': candidates[0]?.inliers != null ? Number(candidates[0].inliers).toLocaleString() : undefined,
+      } : { 'Wall candidates': 0 };
+    }
+    case 'detect_hvac_fixtures': {
+      const fixtures = jobResult.hvac_fixtures ?? {};
+      const parts = Object.entries(fixtures)
+        .filter(([k, v]: [string, any]) => k !== 'other' && Array.isArray(v) && v.length > 0)
+        .map(([k, v]: [string, any]) => `${v.length} ${k}`);
+      return { 'Fixtures found': parts.length > 0 ? parts.join(', ') : '0' };
+    }
+    case 'locate_rucklauf': {
+      const rk = jobResult.rucklauf_position;
+      const vl = jobResult.vorlauf_position;
+      return {
+        'Rücklauf': rk ? `found (${rk.method})` : 'not found',
+        'Vorlauf': vl ? `found (${vl.method})` : 'not found',
+      };
+    }
+    case 'hvac_placement': {
+      const hp = jobResult.hvac_placement;
+      return hp ? {
+        'Status': hp.status,
+        'Candidates ranked': (hp.candidates ?? []).length,
+        'Best distance to Rücklauf': hp.candidates?.[0]?.distance_to_rucklauf_cm != null
+          ? `${hp.candidates[0].distance_to_rucklauf_cm}cm` : undefined,
+      } : undefined;
+    }
     case 'coverage': {
       const score = jobResult.coverage_score;
       return score !== undefined ? {
@@ -387,6 +444,14 @@ export function buildStageSummary(
       return join(v('Scale applied') && `scale ${v('Scale applied')}`, v('Factor used'));
     case 'coverage':
       return join(v('Coverage score'), v('Re-shoot areas') && `${v('Re-shoot areas')} re-shoot area(s)`);
+    case 'wall_plane_detection':
+      return join(v('Wall candidates') && `${v('Wall candidates')} candidate(s)`, v('Above evidence floor') && `${v('Above evidence floor')} usable`);
+    case 'detect_hvac_fixtures':
+      return v('Fixtures found');
+    case 'locate_rucklauf':
+      return join(v('Rücklauf'), v('Vorlauf') && `Vorlauf ${v('Vorlauf')}`);
+    case 'hvac_placement':
+      return join(v('Status'), v('Candidates ranked') && `${v('Candidates ranked')} ranked`);
     case 'export':
       return v('Files exported');
     default:

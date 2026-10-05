@@ -99,6 +99,13 @@ RUN cd /opt && \
     /opt/lingbot-venv/bin/python -c "import torch,demo; print('lingbot venv torch', torch.__version__)"
 # Checkpoint (~4.6 GB) is lazy-downloaded at first stage run to /app/models/lingbot.
 
+# MetricAnything (monocular metric depth) — runs IN the main env (its
+# requirements pin torch<2.5.0; we use 2.4.1). Cloned outside /app/backend so
+# the ./backend bind mount doesn't hide it. Checkpoint lazy-downloads to
+# /app/models/metricanything at first stage run.
+RUN cd /opt &&     git clone https://github.com/metric-anything/metric-anything.git &&     cd metric-anything && git checkout 616a5e6762f5fc40d1a4ef990fee04c800532f59
+ENV METRICANYTHING_VENDOR_DIR=/opt/metric-anything
+
 # Pre-download LightGlue + DISK weights to /app/models so the worker doesn't
 # fetch them on first run.
 ENV TORCH_HOME=/app/models/torch
